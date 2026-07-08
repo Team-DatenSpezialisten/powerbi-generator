@@ -1,0 +1,32 @@
+# EC2-Deployment: App-Container + Caddy (automatisches HTTPS via Let's Encrypt).
+# Voraussetzung: .env ausgefüllt (inkl. APP_DOMAIN + REDIRECT_URI), DNS der
+# Subdomain zeigt auf die EC2, Ports 80/443 offen.
+#
+# Start:  docker compose up -d --build
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    expose:
+      - "8000"          # nur intern erreichbar; Caddy proxyt darauf
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - APP_DOMAIN=${APP_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # gespeicherte Zertifikate
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  caddy_data:
+  caddy_config:

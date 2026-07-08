@@ -1,0 +1,8 @@
+anthropic>=0.40
+msal>=1.28
+requests>=2.32
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic-settings>=2.4
+python-dotenv>=1.0
+itsdangerous>=2.2

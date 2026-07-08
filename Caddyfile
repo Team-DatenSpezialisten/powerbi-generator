@@ -1,0 +1,5 @@
+# Caddy holt automatisch ein Let's-Encrypt-Zertifikat für APP_DOMAIN und
+# leitet HTTPS-Anfragen an den App-Container (Port 8000) weiter.
+{$APP_DOMAIN} {
+    reverse_proxy app:8000
+}
