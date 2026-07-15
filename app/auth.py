@@ -10,6 +10,10 @@ from .config import settings
 # Scope für die Power BI REST API. `.default` = alle im App-Registration-
 # Manifest vergebenen Application-Permissions.
 _SCOPE = ["https://analysis.windows.net/powerbi/api/.default"]
+# Scope für Microsoft Graph (SharePoint-Dateizugriff, Phase 3). Braucht eine
+# eigene Graph-App-Berechtigung (z. B. Sites.Selected) mit Admin-Zustimmung –
+# derselbe Service Principal, nur ein anderes Token.
+_GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 
 _app: msal.ConfidentialClientApplication | None = None
 
@@ -26,12 +30,12 @@ def _client() -> msal.ConfidentialClientApplication:
     return _app
 
 
-def get_access_token() -> str:
+def _acquire(scope: list[str]) -> str:
     app = _client()
     # Erst den MSAL-Cache prüfen, sonst frisch beim AAD anfragen.
-    result = app.acquire_token_silent(_SCOPE, account=None)
+    result = app.acquire_token_silent(scope, account=None)
     if not result:
-        result = app.acquire_token_for_client(scopes=_SCOPE)
+        result = app.acquire_token_for_client(scopes=scope)
 
     if "access_token" not in result:
         raise RuntimeError(
@@ -39,3 +43,13 @@ def get_access_token() -> str:
             f"{result.get('error_description')}"
         )
     return result["access_token"]
+
+
+def get_access_token() -> str:
+    """AAD-Token für Power BI / Fabric REST API."""
+    return _acquire(_SCOPE)
+
+
+def get_graph_token() -> str:
+    """AAD-Token für Microsoft Graph (SharePoint-Zugriff)."""
+    return _acquire(_GRAPH_SCOPE)

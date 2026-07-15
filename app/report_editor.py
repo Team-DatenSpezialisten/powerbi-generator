@@ -68,6 +68,43 @@ def has_enhanced_visuals(docs: dict[str, Any]) -> bool:
     return any(_VIS_RE.match(p) for p in docs)
 
 
+def iter_visuals(docs: dict[str, Any]):
+    """Iteriert (visual_id, visual.json-Inhalt) über alle Visuals (enhanced)."""
+    for path, content in docs.items():
+        m = _VIS_RE.match(path)
+        if m:
+            yield m.group(2), content
+
+
+def visual_test_dax(content: dict[str, Any]) -> str | None:
+    """Baut aus dem queryState eines bestehenden Visuals eine Prüf-DAX-Query
+    (None = nicht prüfbar). Schlägt sie fehl, rendert das Visual fehlerhaft."""
+    qs = content.get("visual", {}).get("query", {}).get("queryState", {})
+    vals, cats = [], []
+    for obj in qs.values():
+        for proj in obj.get("projections", []):
+            f = proj.get("field", {})
+            try:
+                if "Measure" in f:
+                    vals.append(f"[{f['Measure']['Property']}]")
+                elif "Aggregation" in f:
+                    c = f["Aggregation"]["Expression"]["Column"]
+                    ent = c["Expression"]["SourceRef"]["Entity"]
+                    vals.append(f"SUM('{ent}'[{c['Property']}])")
+                elif "Column" in f:
+                    c = f["Column"]
+                    ent = c["Expression"]["SourceRef"]["Entity"]
+                    cats.append(f"'{ent}'[{c['Property']}]")
+            except (KeyError, TypeError):
+                return None
+    if not vals:
+        return None
+    value_str = ", ".join(f'"v{i}", {e}' for i, e in enumerate(vals))
+    if cats:
+        return f"EVALUATE TOPN(1, SUMMARIZECOLUMNS({', '.join(cats)}, {value_str}))"
+    return f"EVALUATE ROW({value_str})"
+
+
 # ── Klassisches Format (Power BI Desktop): report.json mit sections ─────────
 def classic_report_path(docs: dict[str, Any]) -> str | None:
     """Findet die Haupt-report.json des klassischen Formats (Marker: 'sections')."""
@@ -304,25 +341,44 @@ def apply_edits(docs: dict[str, Any], edits: list[dict[str, Any]],
     übersprungen, statt den ganzen Vorgang abzubrechen.
     """
     measure_table, column_table = rb.lookups(schema)
+    default_value = rb.default_value_name(schema)  # Fallback-Wert für wertlose Diagramme
     log: list[str] = []
 
     for e in edits:
         action = e.get("action")
         try:
-            _apply_one(docs, e, action, measure_table, column_table, log)
+            _apply_one(docs, e, action, measure_table, column_table, log, default_value)
         except Exception as ex:  # noqa: BLE001
             log.append(f"Aktion '{action}' übersprungen: {ex}")
+
+    # Nach dem Hinzufügen von Visuals die betroffene Seite sauber neu anordnen,
+    # damit neue Visuals nicht unten "abfallen" (außer der Nutzer positioniert selbst).
+    manual_pos = any(e.get("action") == "set_position" for e in edits)
+    if not manual_pos:
+        added_pages = {e.get("page_id") or _first_page_id(docs)
+                       for e in edits if e.get("action") == "add_visual"}
+        for pid in added_pages:
+            _auto_layout(docs, pid)
+        if added_pages:
+            log.append("Seite automatisch neu angeordnet, damit alle Visuals passen.")
 
     return log
 
 
-def _apply_one(docs, e, action, measure_table, column_table, log) -> None:
+def _apply_one(docs, e, action, measure_table, column_table, log, default_value=None) -> None:
         if action == "add_visual":
             page_id = e.get("page_id") or _first_page_id(docs)
             pos = _next_position(docs, page_id)
+            vtype = e.get("visual_type", "card")
+            measures = [m for m in (e.get("measures") or []) if m]
+            # Diagramme ohne auflösbaren Wert würden leer rendern -> Standardwert einsetzen
+            if not any(rb.resolves(m, measure_table, column_table) for m in measures):
+                if default_value:
+                    measures = [default_value]
+                    log.append(f"Kein Wert angegeben – „{default_value}“ automatisch ergänzt.")
             visual = {
-                "type": e.get("visual_type", "card"),
-                "measures": e.get("measures", []),
+                "type": vtype,
+                "measures": measures,
                 "category": e.get("category", ""),
             }
             vis_id, content = rb.new_visual_content(visual, pos, measure_table, column_table)

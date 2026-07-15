@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     # Optionale Whitelist (kommagetrennte E-Mails); leer = ganzer Tenant erlaubt.
     allowed_users: str = ""
 
+    # ── SharePoint (Microsoft Graph, Phase 3) ──────────────────
+    # Wurzel-Website, aus der Datei-Datenquellen gelesen werden, z. B.
+    # https://datenspezialisten.sharepoint.com/sites/PowerBI_Test
+    # Leer = SharePoint-Import deaktiviert.
+    sharepoint_site_url: str = ""
+
     @property
     def authority(self) -> str:
         return f"https://login.microsoftonline.com/{self.azure_tenant_id}"

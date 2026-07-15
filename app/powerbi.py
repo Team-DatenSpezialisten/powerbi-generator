@@ -5,6 +5,7 @@ Zwei Kernfunktionen für den PoC:
                    (als Kontext für Claude)
   - execute_dax(): eine DAX-Query gegen das Dataset ausführen und Zeilen zurückgeben
 """
+import re
 from typing import Any
 
 import requests
@@ -13,6 +14,10 @@ from .auth import get_access_token
 from .config import settings
 
 _BASE = "https://api.powerbi.com/v1.0/myorg"
+
+# Versteckte Auto-Datumstabellen von Power BI – verschmutzen das Schema mit
+# doppelten Spalten (Monat, Jahr, …) und führen zu Fehlbindungen. Ausfiltern.
+_HIDDEN_TABLE = re.compile(r"^(DateTableTemplate|LocalDateTable)_", re.IGNORECASE)
 
 
 def _headers() -> dict[str, str]:
@@ -65,6 +70,16 @@ def generate_embed_token(report_id: str, workspace_id: str | None = None) -> str
     return resp.json()["token"]
 
 
+def refresh_dataset(dataset_id: str, workspace_id: str | None = None) -> int:
+    """Stößt eine Aktualisierung des Datasets an (lädt Import-Daten ins Modell)."""
+    workspace_id = workspace_id or settings.pbi_workspace_id
+    url = f"{_BASE}/groups/{workspace_id}/datasets/{dataset_id}/refreshes"
+    resp = requests.post(url, headers=_headers(), json={"notifyOption": "NoNotification"}, timeout=60)
+    if resp.status_code not in (200, 202):
+        raise RuntimeError(f"refresh {resp.status_code}: {resp.text}")
+    return resp.status_code
+
+
 def execute_dax(dax: str, dataset_id: str | None = None) -> list[dict[str, Any]]:
     """Führt eine DAX-Query über die executeQueries-API aus und liefert die Zeilen.
 
@@ -103,6 +118,11 @@ def get_schema(dataset_id: str | None = None) -> dict[str, Any]:
         '"Table", [Table], "Measure", [Name], "Expression", [Expression])',
         dataset_id,
     )
+    # Versteckte Auto-Datumstabellen und technische RowNumber-Spalten entfernen
+    columns = [c for c in columns
+               if not _HIDDEN_TABLE.match(c["[Table]"])
+               and not c["[Column]"].startswith("RowNumber-")]
+    measures = [m for m in measures if not _HIDDEN_TABLE.match(m["[Table]"])]
     return {"columns": columns, "measures": measures}
 
 

@@ -17,6 +17,7 @@ Fabric-Fehlermeldungen nach.
 """
 import base64
 import json
+import re
 import uuid
 from typing import Any
 
@@ -60,15 +61,28 @@ def lookups(schema: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
 
 def _resolve(name: str, measure_table: dict[str, str],
              column_table: dict[str, str]) -> tuple[str, str, bool]:
-    """Ermittelt (Tabelle, Feldname, ist_measure) – robust gegen die Schreibweisen,
-    die Claude liefert: "Feld", "Tabelle.Feld" oder den Anzeigenamen "Summe von Feld"."""
-    name = name.removeprefix("Summe von ").strip()  # Anzeigename -> reine Spalte
-    if "." in name:
-        entity, prop = name.split(".", 1)
-        return entity, prop, prop in measure_table
-    if name in measure_table:
-        return measure_table[name], name, True
-    return column_table.get(name, ""), name, False
+    """Ermittelt (Tabelle, Feldname, ist_measure) – robust gegen alle Schreibweisen,
+    die Claude liefert: "Feld", "Tabelle[Feld]", "'Tabelle'[Feld]", "Tabelle.Feld",
+    "Summe von Feld". Die kanonische Tabelle wird über den Feldnamen im Schema
+    bestimmt (verlässlicher als Claudes Qualifier)."""
+    n = name.strip().removeprefix("Summe von ").strip()
+
+    # Kandidaten für den reinen Feldnamen sammeln
+    candidates = [n]
+    bracket = re.match(r"^'?([^'\[]+?)'?\[(.+)\]$", n)   # Tabelle[Feld] / 'Tabelle'[Feld]
+    if bracket:
+        candidates.append(bracket.group(2).strip())
+    if "." in n:
+        candidates.append(n.split(".", 1)[1].strip())
+
+    for cand in candidates:
+        if cand in measure_table:
+            return measure_table[cand], cand, True
+        if cand in column_table:
+            return column_table[cand], cand, False
+
+    # nichts gefunden -> leere Tabelle (Visual würde brechen; Aufrufer prüft das)
+    return "", candidates[-1], False
 
 
 def _field(name: str, measure_table: dict[str, str], column_table: dict[str, str]) -> dict[str, Any]:
@@ -115,6 +129,61 @@ def roles_for(pbir_type: str, cat: list, values: list) -> dict[str, Any]:
     # clusteredColumnChart, clusteredBarChart, lineChart, pieChart:
     # interner Rollenname ist "Category" (Anzeigename bei Kreis = "Legende") + "Y"
     return {"Category": {"projections": cat}, "Y": {"projections": values}}
+
+
+def _dax_field(name: str, measure_table, column_table) -> str | None:
+    """DAX-Ausdruck für ein Feld (Measure -> [M], Spalte -> SUM('T'[C]))."""
+    entity, prop, is_measure = _resolve(name, measure_table, column_table)
+    if not entity:
+        return None
+    return f"[{prop}]" if is_measure else f"SUM('{entity}'[{prop}])"
+
+
+# Numerische Spaltentypen. INFO.VIEW.COLUMNS liefert freundliche Namen
+# ("Number", "Integer", "Whole Number"); TMSL-Formen ("int64", "double") zur Sicherheit mit.
+_NUMERIC_TYPES = {"number", "integer", "whole number", "decimal number", "currency",
+                  "int64", "double", "decimal"}
+
+
+def resolves(name: str, measure_table, column_table) -> bool:
+    """True, wenn der Feldname auf ein Measure oder eine Spalte auflösbar ist."""
+    return _dax_field(name, measure_table, column_table) is not None
+
+
+def default_value_name(schema: dict[str, Any]) -> str | None:
+    """Ein sinnvolles Standard-Wertfeld für Diagramme ohne Wert:
+    erstes Measure, sonst erste numerische Spalte, sonst None."""
+    measures = schema.get("measures", [])
+    if measures:
+        return measures[0]["[Measure]"]
+    for c in schema.get("columns", []):
+        if str(c.get("[DataType]", "")).lower() in _NUMERIC_TYPES:
+            return c["[Column]"]
+    return None
+
+
+def test_dax_for_visual(visual: dict[str, Any], measure_table, column_table) -> str | None:
+    """Baut eine minimale DAX-Query, die die Felder eines Visuals prüft.
+
+    Rückgabe None, wenn sich kein sinnvoller Test bauen lässt (dann gilt das
+    Visual als nicht darstellbar). Sonst eine EVALUATE-Query, die der Aufrufer
+    gegen das Dataset ausführt – schlägt sie fehl, ist das Visual kaputt.
+    """
+    vals = []
+    for i, m in enumerate(visual.get("measures", [])):
+        expr = _dax_field(m, measure_table, column_table)
+        if expr is None:
+            return None
+        vals.append(f'"v{i}", {expr}')
+    if not vals:
+        return None
+    category = visual.get("category") or ""
+    if category:
+        ce, cp, _ = _resolve(category, measure_table, column_table)
+        if not ce:
+            return None
+        return f"EVALUATE TOPN(1, SUMMARIZECOLUMNS('{ce}'[{cp}], {', '.join(vals)}))"
+    return f"EVALUATE ROW({', '.join(vals)})"
 
 
 def build_projections(measures: list[str], category: str,

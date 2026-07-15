@@ -80,6 +80,16 @@ def create_report(display_name: str, parts: list[dict[str, str]],
     return _await_lro(resp, with_result=True)
 
 
+def rename_item(item_id: str, display_name: str, workspace_id: str | None = None) -> dict[str, Any]:
+    """Benennt ein Fabric-Item um (z. B. Vorschau-Report -> finaler Name)."""
+    workspace_id = workspace_id or settings.pbi_workspace_id
+    url = f"{_FABRIC}/workspaces/{workspace_id}/items/{item_id}"
+    resp = requests.patch(url, headers=_headers(), json={"displayName": display_name}, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"rename_item {resp.status_code}: {resp.text}")
+    return resp.json()
+
+
 def delete_report(report_id: str, workspace_id: str | None = None) -> None:
     """Löscht einen Report (für „Rückgängig" nach dem Erstellen)."""
     workspace_id = workspace_id or settings.pbi_workspace_id
@@ -87,6 +97,37 @@ def delete_report(report_id: str, workspace_id: str | None = None) -> None:
     resp = requests.delete(url, headers=_headers(), timeout=60)
     if resp.status_code not in (200, 204):
         raise RuntimeError(f"delete_report {resp.status_code}: {resp.text}")
+
+
+def create_semantic_model(display_name: str, parts: list[dict[str, str]],
+                          workspace_id: str | None = None) -> dict[str, Any]:
+    """Legt ein neues Semantic Model aus einer Definition an (definition.pbism + model.bim)."""
+    workspace_id = workspace_id or settings.pbi_workspace_id
+    url = f"{_FABRIC}/workspaces/{workspace_id}/semanticModels"
+    body = {"displayName": display_name, "definition": {"parts": parts}}
+    resp = requests.post(url, headers=_headers(), json=body, timeout=120)
+    return _await_lro(resp, with_result=True)
+
+
+def get_model_definition(model_id: str, workspace_id: str | None = None,
+                         fmt: str = "TMSL") -> list[dict[str, str]]:
+    """Liest die Definition eines Semantic Models (TMSL = model.bim JSON)."""
+    workspace_id = workspace_id or settings.pbi_workspace_id
+    url = f"{_FABRIC}/workspaces/{workspace_id}/semanticModels/{model_id}/getDefinition"
+    if fmt:
+        url += f"?format={fmt}"
+    resp = requests.post(url, headers=_headers(), timeout=120)
+    data = _await_lro(resp, with_result=True)
+    return data["definition"]["parts"]
+
+
+def update_model_definition(model_id: str, parts: list[dict[str, str]],
+                            workspace_id: str | None = None) -> dict[str, Any]:
+    """Schreibt eine geänderte Semantic-Model-Definition zurück."""
+    workspace_id = workspace_id or settings.pbi_workspace_id
+    url = f"{_FABRIC}/workspaces/{workspace_id}/semanticModels/{model_id}/updateDefinition"
+    resp = requests.post(url, headers=_headers(), json={"definition": {"parts": parts}}, timeout=120)
+    return _await_lro(resp, with_result=False)
 
 
 def get_report_definition(report_id: str, workspace_id: str | None = None,

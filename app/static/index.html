@@ -18,10 +18,15 @@
     main { max-width:900px; margin:24px auto; padding:0 16px; }
     .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px; margin-bottom:20px; }
     label { font-size:13px; font-weight:600; color:var(--muted); display:block; margin-bottom:6px; }
-    select, textarea { width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:8px; font:inherit; background:#fff; color:var(--ink); }
+    select, textarea, input[type=text] { width:100%; padding:10px 12px; border:1px solid var(--border); border-radius:8px; font:inherit; background:#fff; color:var(--ink); }
     textarea { resize:vertical; min-height:70px; }
-    .tabs { display:flex; gap:8px; margin:0 0 16px; }
-    .tab { flex:1; padding:10px; text-align:center; cursor:pointer; border:1px solid var(--border); border-radius:8px; background:#fff; font-weight:600; font-size:14px; color:var(--muted); }
+    input[type=file] { font:inherit; font-size:13px; }
+    table.prev { border-collapse:collapse; font-size:12px; }
+    table.prev th, table.prev td { border:1px solid var(--border); padding:5px 9px; text-align:left; white-space:nowrap; }
+    table.prev th { background:#f2f4f6; }
+    table.prev td { color:var(--ink); }
+    .tabs { display:flex; gap:8px; margin:0 0 16px; flex-wrap:wrap; }
+    .tab { flex:1 1 140px; padding:10px 6px; text-align:center; cursor:pointer; border:1px solid var(--border); border-radius:8px; background:#fff; font-weight:600; font-size:13px; color:var(--muted); }
     .tab.active { background:var(--brand); color:#fff; border-color:var(--brand); }
     .row { margin-bottom:14px; }
     button { font:inherit; border:0; border-radius:8px; font-weight:600; cursor:pointer; }
@@ -35,6 +40,9 @@
     #result:empty { display:none; }
     .explain { background:#eef7f2; border-left:3px solid var(--brand); padding:10px 12px; border-radius:6px; }
     ul.log { margin:12px 0 0; padding-left:20px; }
+    ul.log li { margin-bottom:3px; }
+    ul.log .vt { display:inline-block; min-width:120px; color:var(--brand); font-weight:600; }
+    ul.log .muted { color:var(--muted); font-size:12px; }
     pre { background:var(--code); padding:12px; border-radius:8px; overflow-x:auto; font-size:13px; margin:12px 0 0; }
     .ok { color:var(--brand); font-weight:600; }
     .err { color:#b42318; background:#fef3f2; border-left:3px solid #b42318; padding:10px 12px; border-radius:6px; }
@@ -67,6 +75,9 @@
       <div class="tabs">
         <div class="tab active" data-mode="create">📊 Dashboard erstellen</div>
         <div class="tab" data-mode="modify">✏️ Dashboard anpassen</div>
+        <div class="tab" data-mode="measure">📐 Kennzahl hinzufügen</div>
+        <div class="tab" data-mode="import">🗄️ Modell aus Datei</div>
+        <div class="tab" data-mode="sharepoint">🔗 Aus SharePoint</div>
       </div>
 
       <div class="row" id="datasetRow">
@@ -86,10 +97,37 @@
         </details>
       </div>
 
-      <div class="row">
+      <div class="row" id="promptRow">
         <label for="prompt" id="promptLabel">Beschreibe das Dashboard</label>
         <textarea id="prompt"></textarea>
         <div class="hint" id="hint"></div>
+      </div>
+
+      <div id="importRow" style="display:none">
+        <div class="row">
+          <label for="importTarget">Was möchtest du tun?</label>
+          <select id="importTarget">
+            <option value="new">Neues Modell aus Datei anlegen</option>
+            <option value="existing">Tabelle zu bestehendem Modell hinzufügen</option>
+          </select>
+        </div>
+        <div class="row" id="importModelNameRow">
+          <label for="importModelName">Name des neuen Modells</label>
+          <input id="importModelName" type="text" placeholder="z. B. Vertrieb 2025">
+        </div>
+        <div class="row" id="importExistingRow" style="display:none">
+          <label for="importDataset">Zielmodell</label>
+          <select id="importDataset"><option>Lade…</option></select>
+        </div>
+        <div class="row">
+          <label for="importFile">Datei (CSV oder Excel)</label>
+          <input id="importFile" type="file" accept=".csv,.txt,.xlsx,.xlsm">
+        </div>
+        <div class="row">
+          <label for="importTableName">Tabellenname (optional)</label>
+          <input id="importTableName" type="text" placeholder="wird sonst aus dem Dateinamen abgeleitet">
+        </div>
+        <button class="go" id="importGo">Datei prüfen</button>
       </div>
 
       <button class="go" id="go">Dashboard erstellen</button>
@@ -102,6 +140,8 @@
     let mode = "create";
     let workspaceId = null;
     let pendingPlan = null;
+    let pendingCreate = null;
+    let pendingSp = null;   // geplantes SharePoint-Modell (noch nicht angelegt)
     const $ = (id) => document.getElementById(id);
 
     async function api(url, opts) {
@@ -113,9 +153,25 @@
     }
 
     api("/me").then(u => $("userName").textContent = u.name || u.email).catch(() => {});
-    api("/datasets").then(d => fill("dataset", d.datasets, "id", "name")).catch(() => {});
-    api("/reports").then(d => { workspaceId = d.workspace_id; fill("report", d.reports, "id", "displayName");
-      if (mode === "modify") loadOverview(); }).catch(() => {});
+
+    async function refreshDatasets() {
+      try {
+        const d = await api("/datasets");
+        fill("dataset", d.datasets, "id", "name");
+        fill("importDataset", d.datasets, "id", "name");
+      } catch (e) { /* ignore */ }
+    }
+    refreshDatasets();
+
+    async function loadReports() {
+      try {
+        const d = await api("/reports");
+        workspaceId = d.workspace_id;
+        fill("report", d.reports, "id", "displayName");
+        if (mode === "modify") loadOverview();
+      } catch (e) { /* ignore */ }
+    }
+    loadReports();
 
     function fill(id, items, valKey, txtKey) {
       const sel = $(id); sel.innerHTML = "";
@@ -129,9 +185,9 @@
 
     function loadOverview() { embedPreview(); loadFields(); }
 
-    async function embedPreview(reportId) {
+    async function embedPreview(reportId, elId) {
       const rid = reportId || $("report").value;
-      const el = $("preview");
+      const el = $(elId || "preview");
       if (!rid) { el.innerHTML = '<div class="ph">Kein Dashboard gewählt.</div>'; return; }
       el.innerHTML = '<div class="ph">⏳ Vorschau wird geladen…</div>';
       try {
@@ -173,25 +229,62 @@
     }
 
     function setModeUI() {
-      const create = mode === "create";
-      $("datasetRow").style.display = create ? "" : "none";
-      $("reportRow").style.display = create ? "none" : "";
-      $("overviewRow").style.display = create ? "none" : "";
-      if (!create) loadOverview();
-      $("promptLabel").textContent = create ? "Beschreibe das Dashboard" : "Was soll geändert werden?";
-      $("prompt").placeholder = create
-        ? "z. B. Übersicht zum Rohertrag: Kennzahlen als Karten, Rohertrag pro Herkunft und über die Zeit"
-        : "z. B. Mach aus dem Balkendiagramm ein Kreisdiagramm und füge eine Karte für Erlös Netto hinzu";
-      $("hint").textContent = create
-        ? "Claude entwirft das Layout und legt einen neuen Report im Workspace an."
-        : "Claude plant die Änderungen – du siehst erst eine Vorschau und bestätigst dann.";
-      $("go").textContent = create ? "Dashboard erstellen" : "Änderungen planen";
+      const create = mode === "create", modify = mode === "modify",
+            measure = mode === "measure", isImport = mode === "import",
+            sp = mode === "sharepoint";
+      $("datasetRow").style.display = (create || measure) ? "" : "none";
+      $("reportRow").style.display = modify ? "" : "none";
+      $("overviewRow").style.display = modify ? "" : "none";
+      $("promptRow").style.display = isImport ? "none" : "";
+      $("go").style.display = isImport ? "none" : "";
+      $("importRow").style.display = isImport ? "" : "none";
+      if (modify) loadOverview();
+      if (isImport) { setImportTargetUI(); return; }
+      if (measure) {
+        $("promptLabel").textContent = "Beschreibe die Kennzahl";
+        $("prompt").placeholder = "z. B. Durchschnittlicher Rohertrag pro Bestellung";
+        $("hint").textContent = "Claude erzeugt ein DAX-Measure und fügt es dem Datenmodell hinzu (prüft die DAX vorher).";
+        $("go").textContent = "Kennzahl hinzufügen";
+      } else if (create) {
+        $("promptLabel").textContent = "Beschreibe das Dashboard";
+        $("prompt").placeholder = "z. B. Übersicht zum Rohertrag: Kennzahlen als Karten, Rohertrag pro Herkunft und über die Zeit";
+        $("hint").textContent = "Claude entwirft das Layout und legt einen neuen Report im Workspace an.";
+        $("go").textContent = "Dashboard erstellen";
+      } else if (sp) {
+        $("promptLabel").textContent = "Welches Modell soll aus SharePoint entstehen?";
+        $("prompt").placeholder = "z. B. Ein Modell für unsere Vertriebszahlen";
+        $("hint").textContent = "Claude sucht die passenden Dateien in SharePoint und gruppiert sie zu Tabellen – du siehst erst eine Vorschau und bestätigst dann.";
+        $("go").textContent = "Datenquellen suchen";
+      } else {
+        $("promptLabel").textContent = "Was soll geändert werden?";
+        $("prompt").placeholder = "z. B. Mach aus dem Balkendiagramm ein Kreisdiagramm und füge eine Karte für Erlös Netto hinzu";
+        $("hint").textContent = "Claude plant die Änderungen – du siehst erst eine Vorschau und bestätigst dann.";
+        $("go").textContent = "Änderungen planen";
+      }
     }
     setModeUI();
 
+    // Offene, unbestätigte Vorschau (Temp-Report) wegräumen, damit keine
+    // _Vorschau_-Leichen im Workspace zurückbleiben (Tab-Wechsel / Seite verlassen).
+    function discardActivePreview(useBeacon) {
+      const pid = (pendingPlan && pendingPlan.preview_report_id) ||
+                  (pendingCreate && pendingCreate.preview_report_id);
+      if (!pid) return;
+      const body = JSON.stringify({ preview_report_id: pid });
+      if (useBeacon && navigator.sendBeacon) {
+        navigator.sendBeacon("/discard-preview", new Blob([body], { type: "application/json" }));
+      } else {
+        fetch("/discard-preview", { method: "POST", keepalive: true,
+          headers: { "Content-Type": "application/json" }, body }).catch(() => {});
+      }
+    }
+    window.addEventListener("beforeunload", () => discardActivePreview(true));
+
     document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+      discardActivePreview(false);  // ggf. offene Vorschau des alten Tabs verwerfen
       document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
-      t.classList.add("active"); mode = t.dataset.mode; pendingPlan = null;
+      t.classList.add("active"); mode = t.dataset.mode;
+      pendingPlan = null; pendingCreate = null; pendingSp = null;
       $("result").innerHTML = ""; setModeUI();
     });
 
@@ -220,13 +313,40 @@
       out.innerHTML = '<div class="spinner">⏳ Claude arbeitet…</div>';
       try {
         if (mode === "create") {
-          const d = await api("/create-report", {
+          out.innerHTML = '<div class="spinner">⏳ Vorschau wird erstellt…</div>';
+          pendingCreate = await api("/preview-create", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ prompt: text, dataset_id: $("dataset").value })
           });
-          out.innerHTML = `<p class="ok">✅ Report „${d.created}" wurde erstellt.</p>` +
-            openLink((d.fabric_result || {}).id) + undoButton();
-          wireUndo();
+          const dropped = pendingCreate.dropped || [];
+          const droppedNote = dropped.length
+            ? `<p class="hint">ℹ️ ${dropped.length} nicht darstellbare(s) Visual(s) wurden automatisch weggelassen: ${dropped.join(", ")}</p>`
+            : "";
+          out.innerHTML =
+            `<div class="explain">Vorschau für „${pendingCreate.title}" – so würde das neue Dashboard aussehen:</div>` +
+            droppedNote +
+            `<div class="preview" id="createPreview" style="margin:12px 0"></div>` +
+            `<div class="actions"><button class="sec" id="cCancel">Verwerfen</button>` +
+            `<button class="prim" id="cAccept">Übernehmen</button></div>`;
+          embedPreview(pendingCreate.preview_report_id, "createPreview");
+          $("cCancel").onclick = discardCreate;
+          $("cAccept").onclick = acceptCreate;
+        } else if (mode === "sharepoint") {
+          out.innerHTML = '<div class="spinner">⏳ SharePoint wird durchsucht…</div>';
+          pendingSp = await api("/sharepoint/plan-model", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt: text })
+          });
+          renderSpPlan(pendingSp);
+        } else if (mode === "measure") {
+          const d = await api("/add-measure", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt: text, dataset_id: $("dataset").value })
+          });
+          out.innerHTML =
+            `<p class="ok">✅ Kennzahl „${d.measure}" wurde dem Modell hinzugefügt.</p>` +
+            `<div class="explain">${d.explanation}</div>` +
+            `<pre>'${d.table}'[${d.measure}] = ${d.dax}${d.format ? "   (Format: " + d.format + ")" : ""}</pre>`;
         } else {
           out.innerHTML = '<div class="spinner">⏳ Vorschau wird erstellt…</div>';
           pendingPlan = await api("/preview-modify", {
@@ -289,7 +409,176 @@
       }
     }
 
+    async function acceptCreate() {
+      if (!pendingCreate) return;
+      const p = pendingCreate; pendingCreate = null;
+      const out = $("result");
+      out.innerHTML = '<div class="spinner">⏳ Wird übernommen…</div>';
+      try {
+        const d = await api("/confirm-create", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ preview_report_id: p.preview_report_id, display_name: p.title })
+        });
+        out.innerHTML = `<p class="ok">✅ Report „${d.created}" wurde erstellt.</p>` +
+          openLink(d.report_id) + undoButton();
+        wireUndo(); loadReports();
+      } catch (e) {
+        out.innerHTML = `<div class="err">Fehler: ${e.message}</div>`;
+      }
+    }
+
+    async function discardCreate() {
+      const p = pendingCreate; pendingCreate = null;
+      $("result").innerHTML = "";
+      if (p && p.preview_report_id) {
+        try {
+          await api("/discard-preview", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ preview_report_id: p.preview_report_id })
+          });
+        } catch (e) { /* Aufräumen best effort */ }
+      }
+    }
+
     $("go").onclick = run;
+
+    // ── Modell/Tabelle aus Datei (Phase 2) ───────────────────────
+    let importFileObj = null;
+    const TYPE_LABEL = { int64: "Ganzzahl", double: "Dezimalzahl", dateTime: "Datum",
+                         boolean: "Ja/Nein", string: "Text" };
+    const typeLabel = (t) => TYPE_LABEL[t] || t;
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"]/g, c =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    }
+
+    function setImportTargetUI() {
+      const existing = $("importTarget").value === "existing";
+      $("importExistingRow").style.display = existing ? "" : "none";
+      $("importModelNameRow").style.display = existing ? "none" : "";
+    }
+    $("importTarget").onchange = () => { setImportTargetUI(); $("result").innerHTML = ""; };
+    $("importFile").onchange = () => { importFileObj = $("importFile").files[0] || null; };
+    $("importGo").onclick = importPreview;
+
+    async function importPreview() {
+      const out = $("result");
+      if (!importFileObj) { out.innerHTML = '<div class="err">Bitte zuerst eine Datei wählen.</div>'; return; }
+      const fd = new FormData(); fd.append("file", importFileObj);
+      $("importGo").disabled = true;
+      out.innerHTML = '<div class="spinner">⏳ Datei wird geprüft…</div>';
+      try {
+        const d = await api("/import/preview", { method: "POST", body: fd });
+        renderImportPreview(d);
+      } catch (e) {
+        out.innerHTML = `<div class="err">Fehler: ${e.message}</div>`;
+      } finally { $("importGo").disabled = false; }
+    }
+
+    function renderImportPreview(d) {
+      const isNew = $("importTarget").value === "new";
+      const tblName = $("importTableName").value.trim() || d.suggested_table;
+      const head = (d.columns || []).map(c =>
+        `<th>${escapeHtml(c.name)}<br><span class="muted" style="font-weight:400">${typeLabel(c.type)}</span></th>`).join("");
+      const body = (d.sample_rows || []).map(r =>
+        `<tr>${r.map(v => `<td>${escapeHtml(v)}</td>`).join("")}</tr>`).join("");
+      const trunc = d.truncated
+        ? `<p class="hint">⚠️ Die Datei hat mehr als 10.000 Zeilen – es werden nur die ersten 10.000 übernommen.</p>` : "";
+      $("result").innerHTML =
+        `<div class="explain">Erkannt: <b>${d.columns.length} Spalten</b>, <b>${d.row_count} Zeilen</b>. ` +
+        `Tabelle wird „<b>${escapeHtml(tblName)}</b>" heißen.</div>` +
+        `<div style="overflow-x:auto;margin-top:12px"><table class="prev"><tr>${head}</tr>${body}</table></div>` +
+        `<p class="hint">Vorschau der ersten Zeilen.</p>` + trunc +
+        `<div class="actions"><button class="sec" id="impCancel">Abbrechen</button>` +
+        `<button class="prim" id="impConfirm">${isNew ? "Modell anlegen" : "Tabelle hinzufügen"}</button></div>` +
+        `<p class="hint">Danach werden die Daten geladen – das dauert i. d. R. ~1 Minute.</p>`;
+      $("impCancel").onclick = () => { $("result").innerHTML = ""; };
+      $("impConfirm").onclick = importConfirm;
+    }
+
+    async function importConfirm() {
+      const isNew = $("importTarget").value === "new";
+      const out = $("result");
+      const fd = new FormData(); fd.append("file", importFileObj);
+      const tn = $("importTableName").value.trim(); if (tn) fd.append("table_name", tn);
+      let url;
+      if (isNew) {
+        const mn = $("importModelName").value.trim();
+        if (!mn) { out.innerHTML = '<div class="err">Bitte einen Modellnamen angeben.</div>'; return; }
+        fd.append("model_name", mn); url = "/import/create-model";
+      } else {
+        const ds = $("importDataset").value;
+        if (!ds) { out.innerHTML = '<div class="err">Bitte ein Zielmodell wählen.</div>'; return; }
+        fd.append("dataset_id", ds); url = "/import/add-table";
+      }
+      out.innerHTML = '<div class="spinner">⏳ Wird angelegt und Daten werden geladen… (~1 Min., bitte warten)</div>';
+      try {
+        const d = await api(url, { method: "POST", body: fd });
+        const rowsInfo = (d.rows == null)
+          ? "Die Daten werden noch im Hintergrund geladen."
+          : `${d.rows} Zeilen geladen.`;
+        const title = isNew
+          ? `Modell „${escapeHtml(d.model_name)}" wurde angelegt`
+          : `Tabelle „${escapeHtml(d.table_name)}" wurde hinzugefügt`;
+        out.innerHTML = `<p class="ok">✅ ${title}.</p>` +
+          `<div class="explain">Tabelle „${escapeHtml(d.table_name)}" · ${rowsInfo}</div>` +
+          `<p class="hint">Das Modell steht jetzt in „Dashboard erstellen" und „Kennzahl hinzufügen" zur Auswahl.</p>`;
+        refreshDatasets();
+      } catch (e) {
+        out.innerHTML = `<div class="err">Fehler: ${e.message}</div>`;
+      }
+    }
+
+    // ── Modell aus SharePoint (Phase 3) ──────────────────────────
+    function renderSpPlan(p) {
+      const rows = (p.tables || []).map(t => {
+        const files = (t.files || []).map(escapeHtml).join(", ") || "—";
+        return `<li><span class="vt">${escapeHtml(t.table_name)}</span>` +
+               `<span class="muted">📁 ${escapeHtml(t.folder)} · ${(t.files || []).length} Datei(en): ${files}</span></li>`;
+      }).join("");
+      const dropped = (p.dropped || []).length
+        ? `<p class="hint">ℹ️ ${p.dropped.length} vorgeschlagene(r) Ordner existiert nicht und wurde verworfen.</p>` : "";
+      $("result").innerHTML =
+        `<div class="explain">${escapeHtml(p.summary)}</div>` + dropped +
+        `<p class="hint">Neues Modell: <b>${escapeHtml(p.model_name)}</b> — diese Tabellen entstehen:</p>` +
+        `<ul class="log">${rows || "<li>Keine passenden Ordner gefunden.</li>"}</ul>` +
+        `<div class="actions"><button class="sec" id="spCancel">Verwerfen</button>` +
+        `<button class="prim" id="spCreate">Modell anlegen</button></div>` +
+        `<p class="hint">Danach werden die Daten geladen – das dauert i. d. R. ~1 Minute.</p>`;
+      $("spCancel").onclick = () => { pendingSp = null; $("result").innerHTML = ""; };
+      $("spCreate").onclick = createSpModel;
+    }
+
+    async function createSpModel() {
+      if (!pendingSp) return;
+      const p = pendingSp; pendingSp = null;
+      const out = $("result");
+      out.innerHTML = '<div class="spinner">⏳ Modell wird angelegt und Daten werden geladen… (~1 Min., bitte warten)</div>';
+      try {
+        const d = await api("/sharepoint/create-model", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model_name: p.model_name,
+            // files MUSS mit – sonst nimmt das Backend alle Dateien des Ordners
+            tables: (p.tables || []).map(t => ({
+              folder: t.folder, table_name: t.table_name, files: t.files
+            }))
+          })
+        });
+        const rows = (d.tables || []).map(t =>
+          `<li><span class="vt">${escapeHtml(t.table_name)}</span>` +
+          `<span class="muted">${t.rows} Zeilen · ${(t.columns || []).length} Spalten · aus ${(t.files || []).map(escapeHtml).join(", ")}</span></li>`
+        ).join("");
+        const loading = (d.rows_first_table == null)
+          ? '<p class="hint">Die Daten werden noch im Hintergrund geladen.</p>' : "";
+        out.innerHTML = `<p class="ok">✅ Modell „${escapeHtml(d.model_name)}" wurde aus SharePoint angelegt.</p>` +
+          `<ul class="log">${rows}</ul>` + loading +
+          `<p class="hint">Das Modell steht jetzt in „Dashboard erstellen" und „Kennzahl hinzufügen" zur Auswahl.</p>`;
+        refreshDatasets();
+      } catch (e) {
+        out.innerHTML = `<div class="err">Fehler: ${e.message}</div>`;
+      }
+    }
   </script>
 </body>
 </html>
