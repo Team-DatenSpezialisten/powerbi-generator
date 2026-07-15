@@ -137,6 +137,27 @@ def download_file(item_id: str, site_url: str | None = None) -> bytes:
     return resp.content
 
 
+def list_data_files(folder: str = "", recursive: bool = False,
+                    site_url: str | None = None) -> list[dict[str, Any]]:
+    """Alle Datendateien eines Ordners – optional inklusive Unterordner.
+
+    Rekursiv ist der Normalfall für gewachsene Ablagen (z. B. ein Monatsordner
+    je Lieferung): Alle Dateien darunter gehören zu derselben Tabelle.
+    Jedes Element bekommt zusätzlich "folder" (wo es liegt).
+    """
+    out: list[dict[str, Any]] = []
+
+    def walk(path: str) -> None:
+        for it in list_folder(path, site_url):
+            if it["type"] == "file" and (it["name"] or "").lower().endswith(DATA_EXT):
+                out.append({**it, "folder": path})
+            elif it["type"] == "folder" and recursive:
+                walk(f"{path}/{it['name']}".strip("/"))
+
+    walk((folder or "").strip("/"))
+    return out
+
+
 def download_head(item_id: str, n_bytes: int = 262144,
                   site_url: str | None = None) -> tuple[bytes, bool]:
     """Lädt nur die ersten n_bytes einer Datei (HTTP-Range).

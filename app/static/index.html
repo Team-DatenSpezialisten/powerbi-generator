@@ -532,9 +532,14 @@
     // ── Modell aus SharePoint (Phase 3) ──────────────────────────
     function renderSpPlan(p) {
       const rows = (p.tables || []).map(t => {
-        const files = (t.files || []).map(escapeHtml).join(", ") || "—";
+        const shown = (t.sample_files || []).map(escapeHtml).join(", ");
+        const more = t.file_count > (t.sample_files || []).length
+          ? ` … (+${t.file_count - t.sample_files.length} weitere)` : "";
+        const rec = t.recursive
+          ? ' <b>inkl. Unterordner</b> – neue Dateien fließen automatisch mit' : "";
         return `<li><span class="vt">${escapeHtml(t.table_name)}</span>` +
-               `<span class="muted">📁 ${escapeHtml(t.folder)} · ${(t.files || []).length} Datei(en): ${files}</span></li>`;
+               `<span class="muted">📁 ${escapeHtml(t.folder)}${rec} · ` +
+               `${t.file_count} Datei(en): ${shown}${more}</span></li>`;
       }).join("");
       const dropped = (p.dropped || []).length
         ? `<p class="hint">ℹ️ ${p.dropped.length} vorgeschlagene(r) Ordner existiert nicht und wurde verworfen.</p>` : "";
@@ -561,13 +566,15 @@
             model_name: p.model_name,
             // files MUSS mit – sonst nimmt das Backend alle Dateien des Ordners
             tables: (p.tables || []).map(t => ({
-              folder: t.folder, table_name: t.table_name, files: t.files
+              folder: t.folder, table_name: t.table_name,
+              files: t.files, recursive: t.recursive
             }))
           })
         });
         const rows = (d.tables || []).map(t =>
           `<li><span class="vt">${escapeHtml(t.table_name)}</span>` +
-          `<span class="muted">${(t.columns || []).length} Spalten · aus ${(t.files || []).map(escapeHtml).join(", ")}</span></li>`
+          `<span class="muted">${(t.columns || []).length} Spalten · ${t.file_count} Datei(en)` +
+          `${t.recursive ? " inkl. Unterordner" : ""}</span></li>`
         ).join("");
         out.innerHTML = `<p class="ok">✅ Modell „${escapeHtml(d.model_name)}" wurde angelegt.</p>` +
           `<ul class="log">${rows}</ul>` +

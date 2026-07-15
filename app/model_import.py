@@ -411,19 +411,30 @@ def _m_type_b(dtype: str, has_time: bool) -> str:
 
 def build_sharepoint_m(site_url: str, folder: str, files: list[str],
                        columns: list[dict[str, Any]], delimiter: str | None,
-                       encoding: int, is_excel: bool) -> list[str]:
+                       encoding: int, is_excel: bool,
+                       recursive: bool = False, extension: str = ".csv") -> list[str]:
     """Baut die M-Abfrage, die Power BI zu den Dateien in SharePoint schickt.
+
+    recursive=True: alle Dateien UNTERHALB des Ordners (Filter über den Pfad).
+    Damit fließen später hinzugefügte Dateien – etwa ein neuer Monatsordner –
+    beim nächsten Refresh automatisch mit, ohne dass das Modell angefasst wird.
+    recursive=False: nur die namentlich genannten Dateien.
 
     Wichtig: Header werden PRO DATEI hochgestuft und erst danach kombiniert –
     sonst landen die Kopfzeilen der Folgedateien als Datenzeilen in der Tabelle.
     Die Typumwandlung läuft mit Kultur "de-DE" (deutsche Zahlen-/Datumsformate).
     """
-    namelist = ", ".join(f'"{_esc(f)}"' for f in files)
-    cond = f"List.Contains({{{namelist}}}, [Name])"
     folder = (folder or "").strip("/")
-    if folder:  # zusätzlich auf den Ordner eingrenzen (gleiche Dateinamen anderswo)
-        seg = folder.rsplit("/", 1)[-1]
-        cond += f' and Text.EndsWith([Folder Path], "/{_esc(seg)}/")'
+    if recursive:
+        cond = f'Text.Lower([Extension]) = "{_esc(extension.lower())}"'
+        if folder:  # auf den Teilbaum eingrenzen; "/" im Muster trennt Namensteile
+            cond += f' and Text.Contains([Folder Path], "/{_esc(folder)}/")'
+    else:
+        namelist = ", ".join(f'"{_esc(f)}"' for f in files)
+        cond = f"List.Contains({{{namelist}}}, [Name])"
+        if folder:  # gleiche Dateinamen könnten anderswo liegen
+            seg = folder.rsplit("/", 1)[-1]
+            cond += f' and Text.EndsWith([Folder Path], "/{_esc(seg)}/")'
 
     if is_excel:
         read = "Excel.Workbook([Content], true){0}[Data]"
@@ -447,8 +458,9 @@ def build_sharepoint_m(site_url: str, folder: str, files: list[str],
 
 
 def build_sharepoint_table_object(parsed: dict[str, Any], table_name: str,
-                                  site_url: str, folder: str,
-                                  files: list[str]) -> dict[str, Any]:
+                                  site_url: str, folder: str, files: list[str],
+                                  recursive: bool = False,
+                                  extension: str = ".csv") -> dict[str, Any]:
     """TMSL-Tabelle, deren Partition live auf SharePoint zeigt (Variante B)."""
     name = sanitize_name(table_name or parsed["table_name"])
     columns = parsed["columns"]
@@ -462,7 +474,7 @@ def build_sharepoint_table_object(parsed: dict[str, Any], table_name: str,
                        "expression": build_sharepoint_m(
                            site_url, folder, files, columns,
                            parsed.get("delimiter"), parsed.get("encoding", 65001),
-                           parsed.get("is_excel", False))},
+                           parsed.get("is_excel", False), recursive, extension)},
         }],
     }
 

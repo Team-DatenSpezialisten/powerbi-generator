@@ -269,6 +269,7 @@ class SharePointTable(BaseModel):
     folder: str                          # Ordnerpfad relativ zur Bibliothekswurzel
     table_name: str | None = None        # sonst = Ordner-/Dateiname
     files: list[str] | None = None       # nur diese Dateien; leer/None = alle im Ordner
+    recursive: bool = False              # auch Unterordner (neue fließen automatisch mit)
 
 
 class SharePointModelRequest(BaseModel):
@@ -566,33 +567,59 @@ def _sample_file(item: dict) -> bytes:
     return head
 
 
+# So viele Dateien werden für die Struktur-/Typerkennung angelesen. Mehr bringt
+# kaum Genauigkeit, kostet aber je Datei einen Cloud-Roundtrip.
+_MAX_SAMPLE_FILES = 8
+
+
 def _table_from_folder(folder: str, table_name: str | None,
-                       only: list[str] | None = None) -> tuple[dict, dict]:
+                       only: list[str] | None = None,
+                       recursive: bool = False) -> tuple[dict, dict]:
     """Baut eine Tabelle, deren Partition LIVE auf die SharePoint-Dateien zeigt.
 
+    recursive=True nimmt alle Dateien UNTERHALB des Ordners – für Ablagen, die
+    je Lieferung einen Unterordner bekommen (z. B. Monate). Neue Unterordner
+    fließen dann beim Refresh automatisch mit.
+
     Die Daten holt später Power BI selbst (keine Zeilengrenze). Wir lesen hier
-    nur eine Stichprobe je Datei, um Spalten/Typen zu bestimmen und zu prüfen,
-    dass mehrere Dateien wirklich dieselbe Struktur haben.
+    nur eine Stichprobe, um Spalten/Typen zu bestimmen und zu prüfen, dass die
+    Dateien dieselbe Struktur haben.
     Rückgabe: (TMSL-Tabellenobjekt, Info fürs Frontend)."""
     path = folder.strip("/")                       # "/" (Wurzel) -> ""
-    files = [it for it in sharepoint.list_folder(path)
-             if it["type"] == "file" and (it["name"] or "").lower().endswith(sharepoint.DATA_EXT)]
+    files = sharepoint.list_data_files(path, recursive=recursive)
     if only:
         wanted = {f.lower() for f in only}
         files = [f for f in files if (f["name"] or "").lower() in wanted]
     if not files:
         raise RuntimeError(f"Ordner '{folder}' enthält keine passenden CSV/Excel-Dateien.")
+
+    exts = {"." + (f["name"] or "").lower().rsplit(".", 1)[-1] for f in files}
+    if len(exts) > 1:
+        raise RuntimeError(
+            f"Ordner '{folder}' enthält gemischte Dateitypen ({', '.join(sorted(exts))}). "
+            "Eine Tabelle kann nur aus Dateien desselben Typs entstehen.")
+
     # Name: explizit > einzelner Dateiname > Ordnername
     name = table_name or (
         files[0]["name"].rsplit(".", 1)[0] if len(files) == 1
         else (path.rsplit("/", 1)[-1] if path else "Daten"))
 
-    parsed_list = [model_import.parse_upload(f["name"], _sample_file(f)) for f in files]
+    # Stichprobe gleichmäßig über die Dateien verteilen (nicht nur die ersten)
+    step = max(1, len(files) // _MAX_SAMPLE_FILES)
+    sample = files[::step][:_MAX_SAMPLE_FILES]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        contents = list(ex.map(_sample_file, sample))
+    parsed_list = [model_import.parse_upload(f["name"], c)
+                   for f, c in zip(sample, contents)]
     merged = model_import.merge_parsed(parsed_list, name)   # prüft gleiche Struktur
+
     obj = model_import.build_sharepoint_table_object(
-        merged, name, settings.sharepoint_site_url, folder, [f["name"] for f in files])
+        merged, name, settings.sharepoint_site_url, folder,
+        [f["name"] for f in files], recursive, exts.pop())
     # Kein "rows": die Zeilenzahl kennt erst Power BI nach dem Laden.
-    info = {"table_name": merged["table_name"], "files": [f["name"] for f in files],
+    info = {"table_name": merged["table_name"], "file_count": len(files),
+            "files": [f["name"] for f in files[:6]], "recursive": recursive,
+            "sampled": len(sample),
             "columns": [{"name": c["name"], "type": c["dtype"]} for c in merged["columns"]]}
     return obj, info
 
@@ -609,26 +636,54 @@ def sharepoint_plan_model(req: SharePointPlanRequest,
         raise HTTPException(status_code=400,
                             detail="SharePoint ist nicht konfiguriert (SHAREPOINT_SITE_URL fehlt).")
     try:
-        tree = [t for t in sharepoint.folder_tree(req.root) if t["files"]]  # leere Ordner raus
-        if not tree:
+        # ALLE Ordner mitgeben – auch solche ohne eigene Dateien: Genau die sind die
+        # Elternordner (z. B. "ISH_data"), die Claude mit include_subfolders wählen soll.
+        tree = sharepoint.folder_tree(req.root)
+        if not any(t["files"] for t in tree):
             raise RuntimeError("In der SharePoint-Bibliothek wurden keine CSV/Excel-Dateien gefunden.")
         plan = ai.plan_sharepoint_model(req.prompt, tree)
 
-        # Claude darf nur existierende Ordner wählen – erfundene Pfade aussortieren
         known = {t["folder"] for t in tree}
-        tables = [t for t in plan.get("tables", []) if t.get("folder") in known]
-        dropped = [t.get("folder") for t in plan.get("tables", []) if t.get("folder") not in known]
-        if not tables:
-            raise RuntimeError("Zum Wunsch wurden keine passenden Ordner gefunden.")
-
-        # Dateiauswahl gegen die echte Ablage prüfen (Claude darf nichts erfinden);
-        # leere Auswahl = alle Dateien des Ordners
         files_by_folder = {t["folder"]: t["files"] for t in tree}
-        for t in tables:
-            avail = files_by_folder.get(t["folder"], [])
-            chosen = [f for f in (t.get("files") or []) if f in avail]
-            t["files"] = chosen or avail
-        tables = [t for t in tables if t["files"]]
+
+        def files_below(folder: str) -> list[str]:
+            """Dateien im Ordner UND allen Unterordnern."""
+            f = (folder or "").strip("/")
+            out: list[str] = []
+            for t in tree:
+                tf = (t["folder"] or "").strip("/")
+                if not f or tf == f or tf.startswith(f + "/"):
+                    out.extend(t["files"])
+            return out
+
+        # Claude darf nur existierende Ordner/Dateien wählen – alles andere fliegt raus
+        tables: list[dict] = []
+        dropped: list[str] = []
+        for t in plan.get("tables", []):
+            folder = t.get("folder")
+            if folder not in known:
+                dropped.append(str(folder))
+                continue
+            rec = bool(t.get("include_subfolders"))
+            if rec:
+                files = files_below(folder)
+            else:
+                avail = files_by_folder.get(folder, [])
+                chosen = [f for f in (t.get("files") or []) if f in avail]
+                files = chosen or avail
+            if not files:
+                dropped.append(str(folder))
+                continue
+            tables.append({
+                "table_name": t.get("table_name") or folder,
+                "folder": folder,
+                "recursive": rec,
+                # Bei rekursiv keine Dateiliste durchreichen: create-model listet selbst,
+                # damit auch später hinzugefügte Dateien erfasst werden.
+                "files": [] if rec else files,
+                "file_count": len(files),
+                "sample_files": files[:6],
+            })
         if not tables:
             raise RuntimeError("Zum Wunsch wurden keine passenden Dateien gefunden.")
         return {"model_name": plan["model_name"], "summary": plan["summary"],
@@ -656,7 +711,7 @@ def sharepoint_create_model(req: SharePointModelRequest,
         table_objs: list[dict] = []
         infos: list[dict] = []
         for t in req.tables:
-            obj, info = _table_from_folder(t.folder, t.table_name, t.files)
+            obj, info = _table_from_folder(t.folder, t.table_name, t.files, t.recursive)
             table_objs.append(obj)
             infos.append(info)
 

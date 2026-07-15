@@ -212,14 +212,20 @@ _SP_MODEL_SCHEMA = {
                 "properties": {
                     "table_name": {"type": "string", "description": "Sprechender Tabellenname im Modell"},
                     "folder": {"type": "string", "description": "EXAKTER Ordnerpfad aus der Liste"},
+                    "include_subfolders": {
+                        "type": "boolean",
+                        "description": "true = ALLE Dateien unterhalb dieses Ordners (auch aus "
+                                       "Unterordnern) gehören zu dieser Tabelle; künftige Dateien "
+                                       "fließen automatisch mit. Dann 'files' leer lassen.",
+                    },
                     "files": {
                         "type": "array", "items": {"type": "string"},
-                        "description": "Exakte Dateinamen aus diesem Ordner, die zu DIESER Tabelle "
-                                       "gehören (gleiche Struktur, werden aneinandergehängt). "
-                                       "Leer = alle Dateien des Ordners.",
+                        "description": "Nur bei include_subfolders=false: exakte Dateinamen aus "
+                                       "diesem Ordner, die zu DIESER Tabelle gehören. "
+                                       "Leer = alle Dateien direkt im Ordner.",
                     },
                 },
-                "required": ["table_name", "folder", "files"],
+                "required": ["table_name", "folder", "include_subfolders", "files"],
                 "additionalProperties": False,
             },
         },
@@ -237,14 +243,23 @@ def plan_sharepoint_model(request: str, tree: list) -> dict[str, Any]:
     """
     system = (
         "Du wählst aus einer SharePoint-Ablage die passenden Datenquellen für ein neues "
-        "Power-BI-Semantic-Model aus. Unten siehst du alle Ordner mit ihren Datendateien.\n"
+        "Power-BI-Semantic-Model aus. Unten siehst du alle Ordner mit ihren Datendateien "
+        "(die Verschachtelung steht im Pfad, z. B. 'ISH_data/2026-01').\n"
         "Regeln:\n"
-        "- Eine Tabelle besteht aus EINEM Ordner ('folder') und den darin gewählten Dateien ('files').\n"
-        "- Mehrere Dateien dürfen NUR dann in dieselbe Tabelle, wenn sie inhaltlich dasselbe "
-        "sind (z. B. 'vertrieb_2024.csv' + 'vertrieb_2025.csv') – sie werden aneinandergehängt.\n"
+        "- Eine Tabelle besteht aus EINEM Ordner ('folder') plus entweder allen Dateien "
+        "darunter (include_subfolders=true) oder einer Dateiauswahl daraus ('files').\n"
+        "- WICHTIG – gleichartige Dateien über Unterordner: Liegen inhaltlich gleiche Daten "
+        "in mehreren Unterordnern (typisch: ein Ordner je Monat/Lieferung, z. B. "
+        "'Daten/2026-01', 'Daten/2026-02'), dann ist das EINE Tabelle: nimm den "
+        "ÜBERGEORDNETEN Ordner ('Daten') mit include_subfolders=true und lass 'files' leer. "
+        "Dadurch fließen später hinzugefügte Ordner/Dateien automatisch mit. Erzeuge in dem "
+        "Fall NIEMALS eine Tabelle je Unterordner.\n"
+        "- Einzelne, klar abgegrenzte Dateien (z. B. Stammdaten) nimmst du mit "
+        "include_subfolders=false und nennst sie in 'files'.\n"
         "- Dateien mit unterschiedlichem Inhalt (z. B. 'marketing.csv' und 'vertrieb.csv') "
         "gehören NIE in dieselbe Tabelle. Liegen sie im selben Ordner, mach daraus ZWEI "
         "Tabellen mit demselben 'folder', aber unterschiedlichen 'files'.\n"
+        "- Eine Tabelle darf nur Dateien EINES Typs enthalten (nicht CSV und Excel mischen).\n"
         "- Verwende in 'folder' und 'files' AUSSCHLIESSLICH exakt die Pfade/Namen aus der "
         "Liste – erfinde nichts und verändere nichts.\n"
         "- Wähle nur, was zum Wunsch des Nutzers passt. Ist der Wunsch unspezifisch "
