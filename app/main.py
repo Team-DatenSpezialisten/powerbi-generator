@@ -281,6 +281,11 @@ class SharePointPlanRequest(BaseModel):
     root: str = ""    # Unterordner als Startpunkt (leer = ganze Bibliothek)
 
 
+class SharePointLoadRequest(BaseModel):
+    model_id: str
+    table_name: str
+
+
 # Präfix für temporäre Vorschau-Reports (aus der Auswahl ausgeblendet).
 _PREVIEW_PREFIX = "_Vorschau_"
 
@@ -543,11 +548,31 @@ def sharepoint_browse(path: str = "", user: dict = Depends(require_user)) -> dic
         raise HTTPException(status_code=502, detail=str(e))
 
 
+def _sample_file(item: dict) -> bytes:
+    """Liest ein Stück einer SharePoint-Datei – genug für Spalten/Typen.
+
+    Variante B lädt die Daten NICHT in die App; wir brauchen die Datei nur, um
+    Struktur, Trennzeichen und Typen zu erkennen. Bei CSV reicht der Anfang
+    (Range-Request); Excel muss ganz geladen werden (ZIP-Format).
+    """
+    name = (item["name"] or "").lower()
+    if name.endswith((".xlsx", ".xlsm")):
+        return sharepoint.download_file(item["id"])
+    head, truncated = sharepoint.download_head(item["id"])
+    if truncated:
+        cut = head.rfind(b"\n")   # angeschnittene letzte Zeile verwerfen
+        if cut > 0:
+            head = head[:cut]
+    return head
+
+
 def _table_from_folder(folder: str, table_name: str | None,
                        only: list[str] | None = None) -> tuple[dict, dict]:
-    """Lädt Datendateien eines SharePoint-Ordners und hängt sie (gleiche Struktur)
-    zu EINER Tabelle zusammen. 'only' grenzt auf bestimmte Dateinamen ein – nötig,
-    wenn in einem Ordner mehrere unterschiedliche Datensätze liegen.
+    """Baut eine Tabelle, deren Partition LIVE auf die SharePoint-Dateien zeigt.
+
+    Die Daten holt später Power BI selbst (keine Zeilengrenze). Wir lesen hier
+    nur eine Stichprobe je Datei, um Spalten/Typen zu bestimmen und zu prüfen,
+    dass mehrere Dateien wirklich dieselbe Struktur haben.
     Rückgabe: (TMSL-Tabellenobjekt, Info fürs Frontend)."""
     path = folder.strip("/")                       # "/" (Wurzel) -> ""
     files = [it for it in sharepoint.list_folder(path)
@@ -561,13 +586,15 @@ def _table_from_folder(folder: str, table_name: str | None,
     name = table_name or (
         files[0]["name"].rsplit(".", 1)[0] if len(files) == 1
         else (path.rsplit("/", 1)[-1] if path else "Daten"))
-    parsed_list = [model_import.parse_upload(f["name"], sharepoint.download_file(f["id"]))
-                   for f in files]
-    merged = model_import.merge_parsed(parsed_list, name)
+
+    parsed_list = [model_import.parse_upload(f["name"], _sample_file(f)) for f in files]
+    merged = model_import.merge_parsed(parsed_list, name)   # prüft gleiche Struktur
+    obj = model_import.build_sharepoint_table_object(
+        merged, name, settings.sharepoint_site_url, folder, [f["name"] for f in files])
+    # Kein "rows": die Zeilenzahl kennt erst Power BI nach dem Laden.
     info = {"table_name": merged["table_name"], "files": [f["name"] for f in files],
-            "rows": merged["row_count"], "truncated": merged["truncated"],
             "columns": [{"name": c["name"], "type": c["dtype"]} for c in merged["columns"]]}
-    return model_import.build_table_object(merged), info
+    return obj, info
 
 
 @app.post("/sharepoint/plan-model")
@@ -613,10 +640,11 @@ def sharepoint_plan_model(req: SharePointPlanRequest,
 @app.post("/sharepoint/create-model")
 def sharepoint_create_model(req: SharePointModelRequest,
                             user: dict = Depends(require_user)) -> dict:
-    """Baut ein neues Semantic Model aus SharePoint-Ordnern (Ordner = Tabelle).
+    """Legt ein Semantic Model an, das LIVE auf SharePoint-Dateien zeigt (Variante B).
 
-    Phase A2 – noch ohne KI: die Ordner werden explizit übergeben. Jeder Ordner
-    wird zu einer Tabelle (alle gleich strukturierten Dateien darin angehängt).
+    Die Daten werden nicht eingebettet – Power BI holt sie selbst. Deshalb ist
+    danach EINMALIG ein manueller Schritt nötig (Modell übernehmen + Datenquelle
+    autorisieren); erst dann kann /sharepoint/load-data die Daten laden.
     """
     if not settings.sharepoint_site_url:
         raise HTTPException(status_code=400,
@@ -643,13 +671,43 @@ def sharepoint_create_model(req: SharePointModelRequest,
                                    "bitte einen anderen Namen wählen.")
             raise
         mid = res.get("id")
-        loaded = _refresh_and_count(mid, infos[0]["table_name"]) if mid and infos else None
         if mid:
             _clear_schema_cache()  # falls das neue Modell direkt bespielt wird
+        # Kein Refresh hier: ohne autorisierte Datenquelle würde er scheitern.
         return {"model_id": mid, "model_name": name, "tables": infos,
-                "rows_first_table": loaded}
+                "needs_authorization": True,
+                "settings_url": (f"https://app.powerbi.com/groups/{settings.pbi_workspace_id}"
+                                 f"/settings/datasets/{mid}") if mid else None}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/sharepoint/load-data")
+def sharepoint_load_data(req: SharePointLoadRequest,
+                         user: dict = Depends(require_user)) -> dict:
+    """Daten laden – nachdem die Datenquelle in Power BI autorisiert wurde.
+
+    Vorher schlägt der Refresh fehl (fehlende Anmeldedaten); das melden wir
+    verständlich zurück, statt einen technischen Fehler durchzureichen.
+    """
+    try:
+        powerbi.refresh_dataset(req.model_id)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400,
+            detail="Die Daten konnten nicht geladen werden. Ist die Datenquelle in "
+                   f"Power BI schon autorisiert? (Details: {str(e)[:200]})")
+    query = f'EVALUATE ROW("n", COUNTROWS(\'{req.table_name}\'))'
+    for _ in range(12):
+        time.sleep(5)
+        try:
+            rows = powerbi.execute_dax(query, req.model_id)
+            _clear_schema_cache()
+            return {"rows": rows[0].get("[n]") if rows else None,
+                    "table_name": req.table_name}
+        except Exception:  # noqa: BLE001
+            continue
+    return {"rows": None, "table_name": req.table_name}  # lädt noch im Hintergrund
 
 
 # ── Anpassen: planen -> anwenden ───────────────────────────────

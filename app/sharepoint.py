@@ -137,6 +137,26 @@ def download_file(item_id: str, site_url: str | None = None) -> bytes:
     return resp.content
 
 
+def download_head(item_id: str, n_bytes: int = 262144,
+                  site_url: str | None = None) -> tuple[bytes, bool]:
+    """Lädt nur die ersten n_bytes einer Datei (HTTP-Range).
+
+    Für Variante B reicht ein Anfangsstück, um Spalten/Typen/Trennzeichen zu
+    erkennen – die eigentlichen Daten holt später Power BI selbst. Bei großen
+    Dateien spart das den kompletten Download.
+    Rückgabe: (bytes, truncated) – truncated=True heißt: Datei ist länger.
+    """
+    drive_id = _drive_for(site_url)
+    url = f"{_GRAPH}/drives/{drive_id}/items/{item_id}/content"
+    resp = requests.get(url, headers={**_headers(), "Range": f"bytes=0-{n_bytes - 1}"},
+                        timeout=60)
+    if resp.status_code not in (200, 206):
+        raise RuntimeError(f"Graph download {resp.status_code}: {resp.text}")
+    # 206 = Teilinhalt; 200 = Server ignorierte Range oder Datei ist kleiner
+    truncated = resp.status_code == 206 and len(resp.content) >= n_bytes
+    return resp.content, truncated
+
+
 def download_by_path(path: str, site_url: str | None = None) -> bytes:
     """Lädt eine Datei über ihren Pfad (relativ zur Bibliothekswurzel)."""
     drive_id = _drive_for(site_url)

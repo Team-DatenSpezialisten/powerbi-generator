@@ -567,16 +567,47 @@
         });
         const rows = (d.tables || []).map(t =>
           `<li><span class="vt">${escapeHtml(t.table_name)}</span>` +
-          `<span class="muted">${t.rows} Zeilen · ${(t.columns || []).length} Spalten · aus ${(t.files || []).map(escapeHtml).join(", ")}</span></li>`
+          `<span class="muted">${(t.columns || []).length} Spalten · aus ${(t.files || []).map(escapeHtml).join(", ")}</span></li>`
         ).join("");
-        const loading = (d.rows_first_table == null)
-          ? '<p class="hint">Die Daten werden noch im Hintergrund geladen.</p>' : "";
-        out.innerHTML = `<p class="ok">✅ Modell „${escapeHtml(d.model_name)}" wurde aus SharePoint angelegt.</p>` +
-          `<ul class="log">${rows}</ul>` + loading +
-          `<p class="hint">Das Modell steht jetzt in „Dashboard erstellen" und „Kennzahl hinzufügen" zur Auswahl.</p>`;
+        out.innerHTML = `<p class="ok">✅ Modell „${escapeHtml(d.model_name)}" wurde angelegt.</p>` +
+          `<ul class="log">${rows}</ul>` +
+          `<div class="explain"><b>Noch ein letzter Schritt:</b> Das Modell liest die Daten direkt ` +
+          `aus SharePoint – dafür muss die Datenquelle einmalig autorisiert werden.</div>` +
+          `<ol class="log"><li><a class="open" style="margin:6px 0" href="${d.settings_url}" target="_blank">Einstellungen in Power BI öffnen ↗</a></li>` +
+          `<li>Oben auf <b>„Übernehmen"</b> klicken</li>` +
+          `<li><b>Datenquellen-Anmeldeinformationen</b> → <b>Anmeldeinformationen bearbeiten</b> → OAuth2 → anmelden</li>` +
+          `<li>Zurück hierher und <b>„Daten laden"</b> klicken</li></ol>` +
+          `<div class="actions"><button class="prim" id="spLoad">Daten laden</button></div>`;
+        $("spLoad").onclick = () => loadSpData(d.model_id, (d.tables[0] || {}).table_name);
         refreshDatasets();
       } catch (e) {
         out.innerHTML = `<div class="err">Fehler: ${e.message}</div>`;
+      }
+    }
+
+    async function loadSpData(modelId, tableName) {
+      const out = $("result");
+      $("spLoad").disabled = true;
+      const note = document.createElement("div");
+      note.className = "spinner";
+      note.textContent = "⏳ Daten werden aus SharePoint geladen… (~1 Min., bitte warten)";
+      out.appendChild(note);
+      try {
+        const d = await api("/sharepoint/load-data", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model_id: modelId, table_name: tableName })
+        });
+        out.innerHTML = (d.rows == null)
+          ? `<p class="ok">✅ Aktualisierung gestartet.</p><p class="hint">Die Daten werden noch im Hintergrund geladen – schau gleich nochmal in Power BI.</p>`
+          : `<p class="ok">✅ ${d.rows} Zeilen aus SharePoint geladen.</p>` +
+            `<p class="hint">Das Modell steht jetzt in „Dashboard erstellen" und „Kennzahl hinzufügen" zur Auswahl.</p>`;
+      } catch (e) {
+        note.remove();
+        const err = document.createElement("div");
+        err.className = "err";
+        err.textContent = "Fehler: " + e.message;
+        out.appendChild(err);
+        $("spLoad").disabled = false;
       }
     }
   </script>

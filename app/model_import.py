@@ -118,17 +118,23 @@ def _infer_type(values: list[Any]) -> str:
 
 
 # ── Datei einlesen ─────────────────────────────────────────────────────────
-def _decode(content: bytes) -> str:
+# Python-Kodierung -> Power-Query-Codepage (fürs Csv.Document in Variante B)
+_M_ENCODING = {"utf-8-sig": 65001, "utf-8": 65001, "cp1252": 1252, "latin-1": 28591}
+
+
+def _decode(content: bytes) -> tuple[str, str]:
+    """Dekodiert und gibt (text, verwendete_kodierung) zurück."""
     for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
         try:
-            return content.decode(enc)
+            return content.decode(enc), enc
         except UnicodeDecodeError:
             continue
-    return content.decode("latin-1", errors="replace")
+    return content.decode("latin-1", errors="replace"), "latin-1"
 
 
-def _read_csv(content: bytes) -> tuple[list, list[list]]:
-    text = _decode(content)
+def _read_csv(content: bytes) -> tuple[list, list[list], str, str]:
+    """Rückgabe: (header, rows, trennzeichen, kodierung)."""
+    text, enc = _decode(content)
     sample = text[:4096]
     try:
         delim = csv.Sniffer().sniff(sample, delimiters=";,\t|").delimiter
@@ -138,7 +144,7 @@ def _read_csv(content: bytes) -> tuple[list, list[list]]:
     rows = [r for r in reader if any((c or "").strip() for c in r)]
     if not rows:
         raise ValueError("Die CSV-Datei enthält keine Zeilen.")
-    return rows[0], rows[1:]
+    return rows[0], rows[1:], delim, enc
 
 
 def _read_xlsx(content: bytes) -> tuple[list, list[list]]:
@@ -185,12 +191,18 @@ def sanitize_name(name: str) -> str:
 
 
 def parse_upload(filename: str, content: bytes) -> dict[str, Any]:
-    """Liest CSV/Excel, erkennt Spalten & Typen, liefert die Zeilen."""
+    """Liest CSV/Excel, erkennt Spalten & Typen, liefert die Zeilen.
+
+    Zusätzlich für Variante B: 'delimiter' und 'encoding' (Codepage) der Datei –
+    damit Power Query dieselbe Datei später genauso liest wie wir hier.
+    """
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
-    if ext in ("xlsx", "xlsm"):
+    is_excel = ext in ("xlsx", "xlsm")
+    if is_excel:
         header, rows = _read_xlsx(content)
+        delim, enc = None, None
     else:
-        header, rows = _read_csv(content)
+        header, rows, delim, enc = _read_csv(content)
 
     header = _clean_headers(header)
     truncated = len(rows) > MAX_ROWS
@@ -213,6 +225,9 @@ def parse_upload(filename: str, content: bytes) -> dict[str, Any]:
         "rows": rows,
         "row_count": len(rows),
         "truncated": truncated,
+        "is_excel": is_excel,
+        "delimiter": delim,
+        "encoding": _M_ENCODING.get(enc or "", 65001),
     }
 
 
@@ -352,12 +367,103 @@ def merge_parsed(parsed_list: list[dict[str, Any]],
             for v in vals if not _is_null(v))
         columns.append({"name": name, "dtype": dtype, "has_time": bool(has_time)})
 
+    first = parsed_list[0]
     return {
-        "table_name": sanitize_name(table_name or parsed_list[0]["table_name"]),
+        "table_name": sanitize_name(table_name or first["table_name"]),
         "columns": columns,
         "rows": rows,
         "row_count": len(rows),
         "truncated": truncated,
+        # Datei-Eigenschaften der ersten Datei durchreichen (Variante B braucht sie)
+        "is_excel": first.get("is_excel", False),
+        "delimiter": first.get("delimiter"),
+        "encoding": first.get("encoding", 65001),
+    }
+
+
+# ── Variante B: echte SharePoint-Quelle statt eingebetteter Daten ──────────
+# Die Daten stehen NICHT im Modell – Power BI holt sie beim Refresh selbst.
+# Damit gibt es keine Zeilengrenze, aber das Dataset braucht einmalig
+# SharePoint-Anmeldedaten (siehe /sharepoint/create-model).
+
+def _esc(s: str) -> str:
+    """String für ein M-Literal in doppelten Anführungszeichen escapen."""
+    return str(s).replace('"', '""')
+
+
+def _m_delim(d: str) -> str:
+    """Trennzeichen als M-Literal (Tab braucht die #(tab)-Schreibweise)."""
+    return {"\t": "#(tab)"}.get(d, _esc(d))
+
+
+def _m_type_b(dtype: str, has_time: bool) -> str:
+    """M-Typ für Table.TransformColumnTypes."""
+    if dtype == "int64":
+        return "Int64.Type"
+    if dtype == "double":
+        return "type number"
+    if dtype == "boolean":
+        return "type logical"
+    if dtype == "dateTime":
+        return "type datetime" if has_time else "type date"
+    return "type text"
+
+
+def build_sharepoint_m(site_url: str, folder: str, files: list[str],
+                       columns: list[dict[str, Any]], delimiter: str | None,
+                       encoding: int, is_excel: bool) -> list[str]:
+    """Baut die M-Abfrage, die Power BI zu den Dateien in SharePoint schickt.
+
+    Wichtig: Header werden PRO DATEI hochgestuft und erst danach kombiniert –
+    sonst landen die Kopfzeilen der Folgedateien als Datenzeilen in der Tabelle.
+    Die Typumwandlung läuft mit Kultur "de-DE" (deutsche Zahlen-/Datumsformate).
+    """
+    namelist = ", ".join(f'"{_esc(f)}"' for f in files)
+    cond = f"List.Contains({{{namelist}}}, [Name])"
+    folder = (folder or "").strip("/")
+    if folder:  # zusätzlich auf den Ordner eingrenzen (gleiche Dateinamen anderswo)
+        seg = folder.rsplit("/", 1)[-1]
+        cond += f' and Text.EndsWith([Folder Path], "/{_esc(seg)}/")'
+
+    if is_excel:
+        read = "Excel.Workbook([Content], true){0}[Data]"
+    else:
+        read = (f'Table.PromoteHeaders(Csv.Document([Content], '
+                f'[Delimiter="{_m_delim(delimiter or ";")}", Encoding={encoding}, '
+                f'QuoteStyle=QuoteStyle.Csv]), [PromoteAllScalars=true])')
+
+    types = ", ".join(f'{{"{_esc(c["name"])}", {_m_type_b(c["dtype"], c["has_time"])}}}'
+                      for c in columns)
+    return [
+        "let",
+        f'    Quelle = SharePoint.Files("{_esc(site_url)}", [ApiVersion = 15]),',
+        f"    Auswahl = Table.SelectRows(Quelle, each {cond}),",
+        f'    MitDaten = Table.AddColumn(Auswahl, "Daten", each {read}),',
+        "    Kombiniert = Table.Combine(MitDaten[Daten]),",
+        f'    Typen = Table.TransformColumnTypes(Kombiniert, {{{types}}}, "de-DE")',
+        "in",
+        "    Typen",
+    ]
+
+
+def build_sharepoint_table_object(parsed: dict[str, Any], table_name: str,
+                                  site_url: str, folder: str,
+                                  files: list[str]) -> dict[str, Any]:
+    """TMSL-Tabelle, deren Partition live auf SharePoint zeigt (Variante B)."""
+    name = sanitize_name(table_name or parsed["table_name"])
+    columns = parsed["columns"]
+    return {
+        "name": name,
+        "columns": [_tmsl_column(c["name"], c["dtype"]) for c in columns],
+        "partitions": [{
+            "name": name,
+            "mode": "import",
+            "source": {"type": "m",
+                       "expression": build_sharepoint_m(
+                           site_url, folder, files, columns,
+                           parsed.get("delimiter"), parsed.get("encoding", 65001),
+                           parsed.get("is_excel", False))},
+        }],
     }
 
 
