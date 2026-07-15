@@ -576,8 +576,14 @@
           `<span class="muted">${(t.columns || []).length} Spalten · ${t.file_count} Datei(en)` +
           `${t.recursive ? " inkl. Unterordner" : ""}</span></li>`
         ).join("");
+        const rels = (d.relationships || []).length
+          ? `<p class="hint" style="margin-top:10px">🔗 Beziehungen automatisch angelegt:</p><ul class="log">` +
+            d.relationships.map(r =>
+              `<li><span class="muted">${escapeHtml(r.from)} → ${escapeHtml(r.to)}</span></li>`).join("") +
+            `</ul>`
+          : "";
         out.innerHTML = `<p class="ok">✅ Modell „${escapeHtml(d.model_name)}" wurde angelegt.</p>` +
-          `<ul class="log">${rows}</ul>` +
+          `<ul class="log">${rows}</ul>` + rels +
           `<div class="explain"><b>Noch ein letzter Schritt:</b> Das Modell liest die Daten direkt ` +
           `aus SharePoint – dafür muss die Datenquelle einmalig autorisiert werden.</div>` +
           `<ol class="log"><li><a class="open" style="margin:6px 0" href="${d.settings_url}" target="_blank">Einstellungen in Power BI öffnen ↗</a></li>` +

@@ -549,22 +549,39 @@ def sharepoint_browse(path: str = "", user: dict = Depends(require_user)) -> dic
         raise HTTPException(status_code=502, detail=str(e))
 
 
-def _sample_file(item: dict) -> bytes:
+def _sample_file(item: dict) -> tuple[bytes, bool]:
     """Liest ein Stück einer SharePoint-Datei – genug für Spalten/Typen.
 
     Variante B lädt die Daten NICHT in die App; wir brauchen die Datei nur, um
     Struktur, Trennzeichen und Typen zu erkennen. Bei CSV reicht der Anfang
     (Range-Request); Excel muss ganz geladen werden (ZIP-Format).
+    Rückgabe: (inhalt, vollständig) – vollständig=False heißt: nur ein Anfang.
     """
     name = (item["name"] or "").lower()
     if name.endswith((".xlsx", ".xlsm")):
-        return sharepoint.download_file(item["id"])
+        return sharepoint.download_file(item["id"]), True
     head, truncated = sharepoint.download_head(item["id"])
     if truncated:
         cut = head.rfind(b"\n")   # angeschnittene letzte Zeile verwerfen
         if cut > 0:
             head = head[:cut]
-    return head
+    return head, not truncated
+
+
+def _unique_columns(merged: dict) -> list[str]:
+    """Spalten, deren Werte in der Stichprobe eindeutig sind (Schlüsselkandidaten).
+
+    Nur aussagekräftig, wenn die Stichprobe die Tabelle vollständig abdeckt –
+    sonst könnten Dubletten außerhalb liegen. Siehe _table_from_folder.
+    """
+    out: list[str] = []
+    rows = merged["rows"]
+    for i, c in enumerate(merged["columns"]):
+        vals = [r[i] if i < len(r) else None for r in rows]
+        vals = [str(v) for v in vals if v is not None and str(v).strip()]
+        if vals and len(set(vals)) == len(vals):
+            out.append(c["name"])
+    return out
 
 
 # So viele Dateien werden für die Struktur-/Typerkennung angelesen. Mehr bringt
@@ -608,18 +625,24 @@ def _table_from_folder(folder: str, table_name: str | None,
     step = max(1, len(files) // _MAX_SAMPLE_FILES)
     sample = files[::step][:_MAX_SAMPLE_FILES]
     with ThreadPoolExecutor(max_workers=8) as ex:
-        contents = list(ex.map(_sample_file, sample))
+        results = list(ex.map(_sample_file, sample))
     parsed_list = [model_import.parse_upload(f["name"], c)
-                   for f, c in zip(sample, contents)]
+                   for f, (c, _) in zip(sample, results)]
     merged = model_import.merge_parsed(parsed_list, name)   # prüft gleiche Struktur
 
     obj = model_import.build_sharepoint_table_object(
         merged, name, settings.sharepoint_site_url, folder,
         [f["name"] for f in files], recursive, exts.pop())
+
+    # Haben wir die Tabelle KOMPLETT gesehen? Nur dann sind Aussagen über
+    # Eindeutigkeit belastbar (wichtig für Beziehungen).
+    complete = (len(sample) == len(files) and all(full for _, full in results)
+                and not merged["truncated"])
     # Kein "rows": die Zeilenzahl kennt erst Power BI nach dem Laden.
     info = {"table_name": merged["table_name"], "file_count": len(files),
             "files": [f["name"] for f in files[:6]], "recursive": recursive,
-            "sampled": len(sample),
+            "sampled": len(sample), "complete_sample": complete,
+            "unique_columns": _unique_columns(merged) if complete else [],
             "columns": [{"name": c["name"], "type": c["dtype"]} for c in merged["columns"]]}
     return obj, info
 
@@ -692,6 +715,49 @@ def sharepoint_plan_model(req: SharePointPlanRequest,
         raise HTTPException(status_code=502, detail=str(e))
 
 
+def _plan_relationships(infos: list[dict]) -> list[dict]:
+    """Lässt Claude Beziehungen vorschlagen und prüft JEDE gegen die echten Daten.
+
+    Eine ungültige Beziehung (z. B. nicht eindeutige Ziel-Spalte) macht das ganze
+    Modell unbrauchbar – der Refresh schlägt dann fehl. Deshalb wird strikt
+    aussortiert: Ziel-Spalte muss nachweislich eindeutig sein, und das ist sie nur,
+    wenn wir die Tabelle vollständig gesehen haben. Im Zweifel keine Beziehung.
+    """
+    try:
+        plan = ai.plan_relationships([
+            {"table_name": i["table_name"],
+             "columns": [c["name"] for c in i["columns"]],
+             "unique_columns": i["unique_columns"],
+             "vollstaendig_geprueft": i["complete_sample"]}
+            for i in infos
+        ])
+    except Exception:  # noqa: BLE001
+        return []   # ohne Beziehungen ist das Modell brauchbar, nur unbequemer
+
+    by_name = {i["table_name"]: i for i in infos}
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for r in plan.get("relationships", []):
+        ft, fc = r.get("from_table"), r.get("from_column")
+        tt, tc = r.get("to_table"), r.get("to_column")
+        src, dst = by_name.get(ft), by_name.get(tt)
+        if not src or not dst or ft == tt:
+            continue
+        if fc not in [c["name"] for c in src["columns"]]:
+            continue
+        if tc not in [c["name"] for c in dst["columns"]]:
+            continue
+        # Kernprüfung: die EINE-Seite muss ein echter, verifizierter Schlüssel sein
+        if not dst["complete_sample"] or tc not in dst["unique_columns"]:
+            continue
+        key = (ft, fc, tt, tc)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(model_import.build_relationship(ft, fc, tt, tc))
+    return out
+
+
 @app.post("/sharepoint/create-model")
 def sharepoint_create_model(req: SharePointModelRequest,
                             user: dict = Depends(require_user)) -> dict:
@@ -715,7 +781,8 @@ def sharepoint_create_model(req: SharePointModelRequest,
             table_objs.append(obj)
             infos.append(info)
 
-        bim = model_import.build_model_bim_tables(name, table_objs)
+        rels = _plan_relationships(infos) if len(infos) > 1 else []
+        bim = model_import.build_model_bim_tables(name, table_objs, rels)
         parts = [report_builder.make_part("definition.pbism", _PBISM),
                  report_builder.make_part("model.bim", bim)]
         try:
@@ -730,6 +797,8 @@ def sharepoint_create_model(req: SharePointModelRequest,
             _clear_schema_cache()  # falls das neue Modell direkt bespielt wird
         # Kein Refresh hier: ohne autorisierte Datenquelle würde er scheitern.
         return {"model_id": mid, "model_name": name, "tables": infos,
+                "relationships": [{"from": f'{r["fromTable"]}[{r["fromColumn"]}]',
+                                   "to": f'{r["toTable"]}[{r["toColumn"]}]'} for r in rels],
                 "needs_authorization": True,
                 "settings_url": (f"https://app.powerbi.com/groups/{settings.pbi_workspace_id}"
                                  f"/settings/datasets/{mid}") if mid else None}

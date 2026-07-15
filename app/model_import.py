@@ -316,17 +316,30 @@ def build_table_object(parsed: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_model_bim_tables(model_name: str, table_objs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Baut ein model.bim für ein neues Modell mit einer oder mehreren Tabellen."""
+def build_relationship(from_table: str, from_column: str,
+                       to_table: str, to_column: str) -> dict[str, Any]:
+    """TMSL-Beziehung (viele-zu-eins; das ist die TMSL-Vorgabe, wenn nichts anderes
+    angegeben ist). 'to_column' muss eindeutig sein, sonst lädt das Modell nicht."""
     return {
-        "name": model_name,
-        "compatibilityLevel": 1600,
-        "model": {
-            "culture": "de-DE",
-            "defaultPowerBIDataSourceVersion": "powerBI_V3",
-            "tables": table_objs,
-        },
+        "name": f"{from_table}_{from_column}__{to_table}_{to_column}"[:100],
+        "fromTable": from_table,
+        "fromColumn": from_column,
+        "toTable": to_table,
+        "toColumn": to_column,
     }
+
+
+def build_model_bim_tables(model_name: str, table_objs: list[dict[str, Any]],
+                           relationships: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Baut ein model.bim für ein neues Modell mit einer oder mehreren Tabellen."""
+    model: dict[str, Any] = {
+        "culture": "de-DE",
+        "defaultPowerBIDataSourceVersion": "powerBI_V3",
+        "tables": table_objs,
+    }
+    if relationships:
+        model["relationships"] = relationships
+    return {"name": model_name, "compatibilityLevel": 1600, "model": model}
 
 
 def build_model_bim(model_name: str, parsed: dict[str, Any]) -> dict[str, Any]:

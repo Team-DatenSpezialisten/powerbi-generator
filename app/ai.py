@@ -270,6 +270,63 @@ def plan_sharepoint_model(request: str, tree: list) -> dict[str, Any]:
     return _complete_json(system, request, _SP_MODEL_SCHEMA)
 
 
+# ── Beziehungen zwischen den Tabellen eines neuen Modells ──────
+_REL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "relationships": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "from_table": {"type": "string", "description": "Tabelle der VIELEN-Seite (Fakten)"},
+                    "from_column": {"type": "string", "description": "Fremdschlüssel-Spalte dort"},
+                    "to_table": {"type": "string", "description": "Tabelle der EINEN-Seite (Stammdaten)"},
+                    "to_column": {"type": "string", "description": "Schlüsselspalte dort – MUSS eindeutig sein"},
+                    "reason": {"type": "string", "description": "Kurze Begründung auf Deutsch"},
+                },
+                "required": ["from_table", "from_column", "to_table", "to_column", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["relationships"],
+    "additionalProperties": False,
+}
+
+
+def plan_relationships(tables: list) -> dict[str, Any]:
+    """Schlägt Beziehungen (viele-zu-eins) zwischen den Tabellen vor.
+
+    'tables' enthält je Tabelle die Spalten und – sofern die Tabelle vollständig
+    eingelesen wurde – die nachweislich eindeutigen Spalten. Nur solche dürfen
+    die EINE-Seite sein; sonst lässt sich das Modell nicht laden.
+    """
+    system = (
+        "Du modellierst ein Power-BI-Datenmodell (Sternschema). Unten stehen die "
+        "Tabellen mit ihren Spalten. Schlage die Beziehungen vor.\n"
+        "Regeln:\n"
+        "- Jede Beziehung ist VIELE-zu-EINS: 'from' ist die Faktentabelle (viele "
+        "Zeilen je Schlüssel), 'to' ist die Stammdatentabelle (ein Eintrag je Schlüssel).\n"
+        "- 'to_column' MUSS in der Liste 'unique_columns' der Zieltabelle stehen. "
+        "Steht sie nicht dort, ist sie kein gültiger Schlüssel – dann die Beziehung "
+        "NICHT vorschlagen.\n"
+        "- Verbinde nur, was inhaltlich zusammengehört. Gleiche/ähnliche Spaltennamen "
+        "sind ein Hinweis (z. B. 'Gebiets-Code' <-> 'Gebiet'), aber prüfe die Bedeutung.\n"
+        "- Verbinde NICHT zwei Stammdatentabellen über eine Spalte, die in beiden "
+        "mehrfach vorkommt – das ergäbe viele-zu-viele.\n"
+        "- Eine Tabelle, die mit KEINER anderen verbunden ist, ist im Modell nutzlos. "
+        "Prüfe für jede Tabelle, ob sie über eine gemeinsame Spalte an eine andere "
+        "anschließt – auch Stammdaten dürfen an Stammdaten hängen (z. B. hat jeder "
+        "Eintrag ein Gebiet, und Gebiete ist der eindeutige Gebiets-Schlüssel). "
+        "Erfinde aber keine Verbindung, wenn es inhaltlich keine gibt.\n"
+        "- Lieber eine Beziehung weglassen als eine falsche vorschlagen. Gibt es keine "
+        "sinnvolle, gib eine leere Liste zurück.\n\n"
+        f"Tabellen:\n{json.dumps(tables, ensure_ascii=False, indent=2)}"
+    )
+    return _complete_json(system, "Welche Beziehungen gehören in dieses Modell?", _REL_SCHEMA)
+
+
 def design_report(prompt: str, schema_text: str) -> dict[str, Any]:
     """Lässt Claude ein Dashboard-Layout entwerfen (Seiten + Visuals).
 
