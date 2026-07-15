@@ -224,8 +224,13 @@ _SP_MODEL_SCHEMA = {
                                        "diesem Ordner, die zu DIESER Tabelle gehören. "
                                        "Leer = alle Dateien direkt im Ordner.",
                     },
+                    "sheet": {
+                        "type": "string",
+                        "description": "Nur bei Excel: EXAKTER Blattname aus 'sheets'. Bei "
+                                       "mehreren Blättern PFLICHT. Sonst leer lassen.",
+                    },
                 },
-                "required": ["table_name", "folder", "include_subfolders", "files"],
+                "required": ["table_name", "folder", "include_subfolders", "files", "sheet"],
                 "additionalProperties": False,
             },
         },
@@ -260,6 +265,13 @@ def plan_sharepoint_model(request: str, tree: list) -> dict[str, Any]:
         "gehören NIE in dieselbe Tabelle. Liegen sie im selben Ordner, mach daraus ZWEI "
         "Tabellen mit demselben 'folder', aber unterschiedlichen 'files'.\n"
         "- Eine Tabelle darf nur Dateien EINES Typs enthalten (nicht CSV und Excel mischen).\n"
+        "- EXCEL-BLÄTTER: Bei Excel-Dateien steht unter 'sheets', welche Blätter es gibt. "
+        "Hat eine Datei mehrere, MUSST du in 'sheet' das richtige nennen – sonst wird "
+        "blind das erste genommen, und das ist oft ein Deck-/Trennblatt (z. B. 'DATA_AREA ->') "
+        "oder eine Auswertung statt der Daten. Wähle das Blatt mit den eigentlichen "
+        "Datensätzen; im Zweifel das, dessen Name zum Tabelleninhalt passt. Enthält eine "
+        "Datei mehrere fachlich verschiedene Blätter, die BEIDE gebraucht werden, mach "
+        "daraus zwei Tabellen mit derselben Datei, aber unterschiedlichem 'sheet'.\n"
         "- Verwende in 'folder' und 'files' AUSSCHLIESSLICH exakt die Pfade/Namen aus der "
         "Liste – erfinde nichts und verändere nichts.\n"
         "- Wähle nur, was zum Wunsch des Nutzers passt. Ist der Wunsch unspezifisch "

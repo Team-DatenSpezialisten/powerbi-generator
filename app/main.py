@@ -270,6 +270,7 @@ class SharePointTable(BaseModel):
     table_name: str | None = None        # sonst = Ordner-/Dateiname
     files: list[str] | None = None       # nur diese Dateien; leer/None = alle im Ordner
     recursive: bool = False              # auch Unterordner (neue fließen automatisch mit)
+    sheet: str | None = None             # Excel: welches Blatt (Pflicht bei mehreren)
 
 
 class SharePointModelRequest(BaseModel):
@@ -589,9 +590,44 @@ def _unique_columns(merged: dict) -> list[str]:
 _MAX_SAMPLE_FILES = 8
 
 
+# So viele Excel-Dateien werden fürs Auflisten der Blätter geöffnet (je ein
+# Volldownload) – bei sehr vielen xlsx würde die Planung sonst zäh.
+_MAX_SHEET_SCAN = 20
+
+
+def _enrich_sheets(tree: list[dict]) -> None:
+    """Ergänzt je Excel-Datei die Blattnamen im Baum (in-place).
+
+    Ohne diese Info könnte Claude bei Mehrblatt-Dateien kein Blatt wählen – und
+    wir würden stumm das erste nehmen, was oft ein Deck-/Trennblatt ist.
+    """
+    items = {((i["folder"] or "").strip("/"), i["name"]): i
+             for i in sharepoint.list_data_files("", recursive=True)}
+    targets = []
+    for t in tree:
+        for n in t["files"]:
+            if n.lower().endswith((".xlsx", ".xlsm")):
+                it = items.get(((t["folder"] or "").strip("/"), n))
+                if it:
+                    targets.append((t, n, it))
+    if not targets:
+        return
+    for t, n, _ in targets[_MAX_SHEET_SCAN:]:
+        t.setdefault("sheets", {})[n] = ["(nicht geprüft)"]
+    targets = targets[:_MAX_SHEET_SCAN]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        contents = list(ex.map(lambda x: sharepoint.download_file(x[2]["id"]), targets))
+    for (t, n, _), c in zip(targets, contents):
+        try:
+            t.setdefault("sheets", {})[n] = model_import.list_sheets(c)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _table_from_folder(folder: str, table_name: str | None,
                        only: list[str] | None = None,
-                       recursive: bool = False) -> tuple[dict, dict]:
+                       recursive: bool = False,
+                       sheet: str | None = None) -> tuple[dict, dict]:
     """Baut eine Tabelle, deren Partition LIVE auf die SharePoint-Dateien zeigt.
 
     recursive=True nimmt alle Dateien UNTERHALB des Ordners – für Ablagen, die
@@ -626,13 +662,13 @@ def _table_from_folder(folder: str, table_name: str | None,
     sample = files[::step][:_MAX_SAMPLE_FILES]
     with ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(_sample_file, sample))
-    parsed_list = [model_import.parse_upload(f["name"], c)
+    parsed_list = [model_import.parse_upload(f["name"], c, sheet)
                    for f, (c, _) in zip(sample, results)]
     merged = model_import.merge_parsed(parsed_list, name)   # prüft gleiche Struktur
 
     obj = model_import.build_sharepoint_table_object(
         merged, name, settings.sharepoint_site_url, folder,
-        [f["name"] for f in files], recursive, exts.pop())
+        [f["name"] for f in files], recursive, exts.pop(), sheet)
 
     # Haben wir die Tabelle KOMPLETT gesehen? Nur dann sind Aussagen über
     # Eindeutigkeit belastbar (wichtig für Beziehungen).
@@ -641,7 +677,7 @@ def _table_from_folder(folder: str, table_name: str | None,
     # Kein "rows": die Zeilenzahl kennt erst Power BI nach dem Laden.
     info = {"table_name": merged["table_name"], "file_count": len(files),
             "files": [f["name"] for f in files[:6]], "recursive": recursive,
-            "sampled": len(sample), "complete_sample": complete,
+            "sheet": sheet, "sampled": len(sample), "complete_sample": complete,
             "unique_columns": _unique_columns(merged) if complete else [],
             "columns": [{"name": c["name"], "type": c["dtype"]} for c in merged["columns"]]}
     return obj, info
@@ -664,6 +700,7 @@ def sharepoint_plan_model(req: SharePointPlanRequest,
         tree = sharepoint.folder_tree(req.root)
         if not any(t["files"] for t in tree):
             raise RuntimeError("In der SharePoint-Bibliothek wurden keine CSV/Excel-Dateien gefunden.")
+        _enrich_sheets(tree)   # Blattnamen je Excel-Datei ergänzen
         plan = ai.plan_sharepoint_model(req.prompt, tree)
 
         known = {t["folder"] for t in tree}
@@ -697,10 +734,20 @@ def sharepoint_plan_model(req: SharePointPlanRequest,
             if not files:
                 dropped.append(str(folder))
                 continue
+            # Blatt nur übernehmen, wenn es die Datei wirklich hat
+            sheet = t.get("sheet") or None
+            if sheet:
+                known_sheets = set()
+                for entry in tree:
+                    for _n, sh in (entry.get("sheets") or {}).items():
+                        known_sheets.update(sh)
+                if sheet not in known_sheets:
+                    sheet = None
             tables.append({
                 "table_name": t.get("table_name") or folder,
                 "folder": folder,
                 "recursive": rec,
+                "sheet": sheet,
                 # Bei rekursiv keine Dateiliste durchreichen: create-model listet selbst,
                 # damit auch später hinzugefügte Dateien erfasst werden.
                 "files": [] if rec else files,
@@ -777,7 +824,8 @@ def sharepoint_create_model(req: SharePointModelRequest,
         table_objs: list[dict] = []
         infos: list[dict] = []
         for t in req.tables:
-            obj, info = _table_from_folder(t.folder, t.table_name, t.files, t.recursive)
+            obj, info = _table_from_folder(t.folder, t.table_name, t.files,
+                                           t.recursive, t.sheet)
             table_objs.append(obj)
             infos.append(info)
 

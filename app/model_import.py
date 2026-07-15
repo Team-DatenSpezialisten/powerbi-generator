@@ -147,13 +147,35 @@ def _read_csv(content: bytes) -> tuple[list, list[list], str, str]:
     return rows[0], rows[1:], delim, enc
 
 
-def _read_xlsx(content: bytes) -> tuple[list, list[list]]:
+def _workbook(content: bytes):
     try:
         from openpyxl import load_workbook
     except ImportError as e:  # noqa: BLE001
         raise RuntimeError("Für Excel-Dateien fehlt die Bibliothek 'openpyxl'.") from e
-    wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-    ws = wb.active
+    return load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+
+
+def list_sheets(content: bytes) -> list[str]:
+    """Blattnamen einer Excel-Datei – Grundlage für die Blattauswahl."""
+    wb = _workbook(content)
+    try:
+        return list(wb.sheetnames)
+    finally:
+        wb.close()
+
+
+def _read_xlsx(content: bytes, sheet: str | None = None) -> tuple[list, list[list]]:
+    """Liest ein Blatt. Ohne Angabe das aktive – das ist bei Mehrblatt-Dateien
+    oft das falsche (z. B. ein leeres Trennblatt), deshalb sollte 'sheet' gesetzt
+    werden, sobald die Datei mehrere Blätter hat."""
+    wb = _workbook(content)
+    if sheet:
+        if sheet not in wb.sheetnames:
+            wb.close()
+            raise ValueError(f"Blatt '{sheet}' gibt es nicht. Vorhanden: {', '.join(wb.sheetnames)}")
+        ws = wb[sheet]
+    else:
+        ws = wb.active
     header: list | None = None
     data: list[list] = []
     for row in ws.iter_rows(values_only=True):
@@ -190,16 +212,18 @@ def sanitize_name(name: str) -> str:
     return name[:80] or "Tabelle"
 
 
-def parse_upload(filename: str, content: bytes) -> dict[str, Any]:
+def parse_upload(filename: str, content: bytes,
+                 sheet: str | None = None) -> dict[str, Any]:
     """Liest CSV/Excel, erkennt Spalten & Typen, liefert die Zeilen.
 
+    'sheet' wählt bei Excel das Blatt (nötig bei Mehrblatt-Dateien).
     Zusätzlich für Variante B: 'delimiter' und 'encoding' (Codepage) der Datei –
     damit Power Query dieselbe Datei später genauso liest wie wir hier.
     """
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
     is_excel = ext in ("xlsx", "xlsm")
     if is_excel:
-        header, rows = _read_xlsx(content)
+        header, rows = _read_xlsx(content, sheet)
         delim, enc = None, None
     else:
         header, rows, delim, enc = _read_csv(content)
@@ -425,7 +449,8 @@ def _m_type_b(dtype: str, has_time: bool) -> str:
 def build_sharepoint_m(site_url: str, folder: str, files: list[str],
                        columns: list[dict[str, Any]], delimiter: str | None,
                        encoding: int, is_excel: bool,
-                       recursive: bool = False, extension: str = ".csv") -> list[str]:
+                       recursive: bool = False, extension: str = ".csv",
+                       sheet: str | None = None) -> list[str]:
     """Baut die M-Abfrage, die Power BI zu den Dateien in SharePoint schickt.
 
     recursive=True: alle Dateien UNTERHALB des Ordners (Filter über den Pfad).
@@ -450,7 +475,10 @@ def build_sharepoint_m(site_url: str, folder: str, files: list[str],
             cond += f' and Text.EndsWith([Folder Path], "/{_esc(seg)}/")'
 
     if is_excel:
-        read = "Excel.Workbook([Content], true){0}[Data]"
+        # Blatt per NAME ansprechen, nicht per Position: {0} waere das erste Blatt
+        # und damit falsch, sobald jemand Blätter umsortiert oder eines einfügt.
+        nav = (f'{{[Item="{_esc(sheet)}",Kind="Sheet"]}}' if sheet else "{0}")
+        read = f"Excel.Workbook([Content], true){nav}[Data]"
     else:
         read = (f'Table.PromoteHeaders(Csv.Document([Content], '
                 f'[Delimiter="{_m_delim(delimiter or ";")}", Encoding={encoding}, '
@@ -472,8 +500,8 @@ def build_sharepoint_m(site_url: str, folder: str, files: list[str],
 
 def build_sharepoint_table_object(parsed: dict[str, Any], table_name: str,
                                   site_url: str, folder: str, files: list[str],
-                                  recursive: bool = False,
-                                  extension: str = ".csv") -> dict[str, Any]:
+                                  recursive: bool = False, extension: str = ".csv",
+                                  sheet: str | None = None) -> dict[str, Any]:
     """TMSL-Tabelle, deren Partition live auf SharePoint zeigt (Variante B)."""
     name = sanitize_name(table_name or parsed["table_name"])
     columns = parsed["columns"]
@@ -487,7 +515,8 @@ def build_sharepoint_table_object(parsed: dict[str, Any], table_name: str,
                        "expression": build_sharepoint_m(
                            site_url, folder, files, columns,
                            parsed.get("delimiter"), parsed.get("encoding", 65001),
-                           parsed.get("is_excel", False), recursive, extension)},
+                           parsed.get("is_excel", False), recursive, extension,
+                           sheet)},
         }],
     }
 

@@ -537,9 +537,10 @@
           ? ` … (+${t.file_count - t.sample_files.length} weitere)` : "";
         const rec = t.recursive
           ? ' <b>inkl. Unterordner</b> – neue Dateien fließen automatisch mit' : "";
+        const sheet = t.sheet ? ` · 📄 Blatt „${escapeHtml(t.sheet)}"` : "";
         return `<li><span class="vt">${escapeHtml(t.table_name)}</span>` +
                `<span class="muted">📁 ${escapeHtml(t.folder)}${rec} · ` +
-               `${t.file_count} Datei(en): ${shown}${more}</span></li>`;
+               `${t.file_count} Datei(en): ${shown}${more}${sheet}</span></li>`;
       }).join("");
       const dropped = (p.dropped || []).length
         ? `<p class="hint">ℹ️ ${p.dropped.length} vorgeschlagene(r) Ordner existiert nicht und wurde verworfen.</p>` : "";
@@ -567,7 +568,7 @@
             // files MUSS mit – sonst nimmt das Backend alle Dateien des Ordners
             tables: (p.tables || []).map(t => ({
               folder: t.folder, table_name: t.table_name,
-              files: t.files, recursive: t.recursive
+              files: t.files, recursive: t.recursive, sheet: t.sheet
             }))
           })
         });
