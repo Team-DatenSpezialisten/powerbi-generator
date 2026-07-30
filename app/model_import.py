@@ -341,16 +341,71 @@ def build_table_object(parsed: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_relationship(from_table: str, from_column: str,
-                       to_table: str, to_column: str) -> dict[str, Any]:
+                       to_table: str, to_column: str,
+                       is_active: bool = True) -> dict[str, Any]:
     """TMSL-Beziehung (viele-zu-eins; das ist die TMSL-Vorgabe, wenn nichts anderes
-    angegeben ist). 'to_column' muss eindeutig sein, sonst lädt das Modell nicht."""
-    return {
+    angegeben ist). 'to_column' muss eindeutig sein, sonst lädt das Modell nicht.
+
+    is_active=False legt die Beziehung inaktiv an (isActive=false) – nötig, wenn sie
+    sonst einen zweiten Pfad zwischen bereits verbundenen Tabellen erzeugen würde
+    (Power BI lehnt mehrdeutige Pfade beim Anlegen ab)."""
+    rel: dict[str, Any] = {
         "name": f"{from_table}_{from_column}__{to_table}_{to_column}"[:100],
         "fromTable": from_table,
         "fromColumn": from_column,
         "toTable": to_table,
         "toColumn": to_column,
     }
+    if not is_active:
+        rel["isActive"] = False
+    return rel
+
+
+def build_fk_relationships(fks: list[dict[str, str]],
+                           table_names: list[str]) -> list[dict[str, Any]]:
+    """Baut TMSL-Beziehungen 1:1 aus den in der DB deklarierten Foreign Keys.
+
+    Kein KI-Raten, keine Daten- oder Schema-Weitergabe an ein LLM: Die Beziehungen
+    kommen direkt aus mssql.foreign_keys(). Berücksichtigt werden nur FKs, deren
+    beide Tabellen im Modell liegen ('table_names').
+
+    Union-Find-Wächter: Würde ein FK eine ZWEITE Verbindung zwischen bereits
+    (indirekt) verbundenen Tabellen bilden, wird er inaktiv angelegt statt
+    verworfen – so bleibt das Schema vollständig abgebildet, ohne dass Power BI
+    mehrdeutige Pfade (ambiguous paths) bekommt. Beim aktuellen Addison-Schema
+    entstehen 0 inaktive; der Wächter ist Absicherung gegen künftige Änderungen.
+    """
+    names = set(table_names)
+    parent: dict[str, str] = {}
+
+    def root(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    # Dimensions-FKs zuerst, Mandanten-FKs (-> StammMandant) zuletzt einordnen:
+    # entstünde je ein Zyklus, würde eher eine redundante Mandanten-Beziehung
+    # inaktiv als eine fachliche.
+    ordered = sorted(fks, key=lambda f: (f.get("ref_table") == "StammMandant",
+                                         f.get("parent_table", ""), f.get("parent_col", "")))
+    out: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
+    for f in ordered:
+        ft, fc = f.get("parent_table"), f.get("parent_col")
+        tt, tc = f.get("ref_table"), f.get("ref_col")
+        if ft not in names or tt not in names or ft == tt:
+            continue
+        key = (ft, fc, tt, tc)
+        if key in seen:
+            continue
+        seen.add(key)
+        active = root(ft) != root(tt)
+        if active:
+            parent[root(ft)] = root(tt)
+        out.append(build_relationship(ft, fc, tt, tc, is_active=active))
+    return out
 
 
 def build_model_bim_tables(model_name: str, table_objs: list[dict[str, Any]],
@@ -486,13 +541,20 @@ def build_sharepoint_m(site_url: str, folder: str, files: list[str],
 
     types = ", ".join(f'{{"{_esc(c["name"])}", {_m_type_b(c["dtype"], c["has_time"])}}}'
                       for c in columns)
+    # Spalten POSITIONSBASIERT auf unsere Namen umbenennen, BEVOR Typen gesetzt
+    # werden. Wichtig bei Quelldateien mit leerer Kopfzeile: Power BI nennt eine
+    # solche Spalte z. B. "Column3", unser Parser aber "Spalte_3" – ohne dieses
+    # Mapping würde TransformColumnTypes die Spalte nicht finden (Refresh scheitert).
+    names = ", ".join(f'"{_esc(c["name"])}"' for c in columns)
     return [
         "let",
         f'    Quelle = SharePoint.Files("{_esc(site_url)}", [ApiVersion = 15]),',
         f"    Auswahl = Table.SelectRows(Quelle, each {cond}),",
         f'    MitDaten = Table.AddColumn(Auswahl, "Daten", each {read}),',
         "    Kombiniert = Table.Combine(MitDaten[Daten]),",
-        f'    Typen = Table.TransformColumnTypes(Kombiniert, {{{types}}}, "de-DE")',
+        f'    Benannt = Table.RenameColumns(Kombiniert, '
+        f'List.Zip({{Table.ColumnNames(Kombiniert), {{{names}}}}}), MissingField.Ignore),',
+        f'    Typen = Table.TransformColumnTypes(Benannt, {{{types}}}, "de-DE")',
         "in",
         "    Typen",
     ]
@@ -517,6 +579,130 @@ def build_sharepoint_table_object(parsed: dict[str, Any], table_name: str,
                            parsed.get("delimiter"), parsed.get("encoding", 65001),
                            parsed.get("is_excel", False), recursive, extension,
                            sheet)},
+        }],
+    }
+
+
+# ── Variante C: MS SQL (Addison) als Live-Quelle ───────────────
+# Wie Variante B holt Power BI die Daten beim Refresh selbst – nur über
+# Sql.Database() statt SharePoint.Files(). Keine Zeilengrenze, keine
+# eingebetteten Daten. Die Typen liefert SQL Server nativ mit, deshalb ist
+# die M-Abfrage schlanker als bei CSV (kein locale-Parsing nötig).
+
+# SQL-Server-Datentyp -> TMSL-Datentyp. Alles Unbekannte wird 'string'.
+_SQL_TO_TMSL = {
+    "bigint": "int64", "int": "int64", "smallint": "int64", "tinyint": "int64",
+    "bit": "boolean",
+    "float": "double", "real": "double", "decimal": "double", "numeric": "double",
+    "money": "double", "smallmoney": "double",
+    "datetime": "dateTime", "datetime2": "dateTime", "smalldatetime": "dateTime",
+    "date": "dateTime", "datetimeoffset": "dateTime",
+}
+
+
+def _sql_tmsl_type(sql_type: str) -> str:
+    return _SQL_TO_TMSL.get((sql_type or "").lower(), "string")
+
+
+def _sql_tmsl_column(name: str, sql_type: str) -> dict[str, Any]:
+    tmsl = _sql_tmsl_type(sql_type)
+    col: dict[str, Any] = {
+        "name": name,
+        "dataType": tmsl,
+        "sourceColumn": name,
+        "summarizeBy": "sum" if tmsl in ("int64", "double") else "none",
+    }
+    if tmsl == "dateTime":
+        col["formatString"] = "General Date"
+    return col
+
+
+# SQL-Datumstypen -> (M-Untergrenze, M-Ergebnistyp) für die Datumsbereinigung.
+_SQL_DATE_KIND = {
+    "date": ("#date(1900, 3, 1)", "type nullable date"),
+    "datetime": ("#datetime(1900, 3, 1, 0, 0, 0)", "type nullable datetime"),
+    "datetime2": ("#datetime(1900, 3, 1, 0, 0, 0)", "type nullable datetime"),
+    "smalldatetime": ("#datetime(1900, 3, 1, 0, 0, 0)", "type nullable datetime"),
+}
+
+
+def _sql_date_transforms(columns: list[dict[str, str]]) -> str:
+    """M-Transformationsliste, die in JEDER Datumsspalte Werte vor dem 01.03.1900
+    auf null setzt.
+
+    Hintergrund: Power BI/VertiPaq unterstützt Datumswerte erst ab dem 01.03.1900.
+    Ältere Sentinel-/Leerwerte (in Buchhaltungsdaten üblich, z. B. 1900-01-01 oder
+    0001-01-01) lösen beim Refresh sonst 'invalid date'-Fehler aus. Ausgewertet
+    werden nur die Spalten-TYPEN (Metadaten) – KEINE Datenwerte; die eigentliche
+    Bereinigung führt Power BI beim Laden aus.
+    """
+    parts: list[str] = []
+    for c in columns:
+        kind = _SQL_DATE_KIND.get((c.get("type") or "").lower())
+        if not kind:
+            continue
+        bound, rtype = kind
+        parts.append(
+            f'{{"{_esc(c["name"])}", each if _ = null then null '
+            f'else if _ < {bound} then null else _, {rtype}}}')
+    return ", ".join(parts)
+
+
+def build_sql_m(server: str, port: int, database: str, schema: str, table: str,
+                mandant_col: str | None = None, mandant_val: str | None = None,
+                columns: list[dict[str, str]] | None = None) -> list[str]:
+    """M-Abfrage, die Power BI an den SQL-Server schickt (eine Tabelle).
+
+    mandant_col/mandant_val filtern optional auf einen Mandanten – nötig, solange
+    wir Single-Mandant-Modelle bauen (dann ist z. B. KONTO eindeutig und
+    Beziehungen funktionieren ohne kombinierten Schlüssel).
+
+    'columns' (mssql.get_columns()): werden mitgegeben, um Datumsspalten gegen
+    ungültige Datümer (< 01.03.1900) abzusichern (siehe _sql_date_transforms).
+    """
+    srv = server if int(port) == 1433 else f"{server},{port}"
+    lines = [
+        "let",
+        f'    Quelle = Sql.Database("{_esc(srv)}", "{_esc(database)}"),',
+        f'    Navigation = Quelle{{[Schema="{_esc(schema)}", Item="{_esc(table)}"]}}[Data]',
+    ]
+    final = "Navigation"
+    if mandant_col and mandant_val is not None:
+        lines[-1] += ","
+        lines.append(
+            f'    Gefiltert = Table.SelectRows(Navigation, each [{_esc(mandant_col)}] = '
+            f'"{_esc(mandant_val)}")')
+        final = "Gefiltert"
+    date_tr = _sql_date_transforms(columns or [])
+    if date_tr:
+        lines[-1] += ","
+        lines.append(f"    Bereinigt = Table.TransformColumns({final}, {{{date_tr}}})")
+        final = "Bereinigt"
+    lines += ["in", f"    {final}"]
+    return lines
+
+
+def build_sql_table_object(server: str, port: int, database: str, schema: str,
+                           table: str, columns: list[dict[str, str]],
+                           table_name: str | None = None,
+                           mandant_col: str | None = None,
+                           mandant_val: str | None = None) -> dict[str, Any]:
+    """TMSL-Tabelle, deren Partition live auf eine SQL-Server-Tabelle zeigt.
+
+    'columns' ist die Ausgabe von mssql.get_columns() ([{name, type}]) – der
+    SQL-Datentyp wird auf den passenden TMSL-Typ abgebildet.
+    """
+    name = sanitize_name(table_name or table)
+    return {
+        "name": name,
+        "columns": [_sql_tmsl_column(c["name"], c["type"]) for c in columns],
+        "partitions": [{
+            "name": name,
+            "mode": "import",
+            "source": {"type": "m",
+                       "expression": build_sql_m(server, port, database, schema,
+                                                 table, mandant_col, mandant_val,
+                                                 columns=columns)},
         }],
     }
 

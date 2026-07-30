@@ -339,6 +339,59 @@ def plan_relationships(tables: list) -> dict[str, Any]:
     return _complete_json(system, "Welche Beziehungen gehören in dieses Modell?", _REL_SCHEMA)
 
 
+# ── Prompt -> Auswahl von SQL-Tabellen (Addison, Variante C) ───
+_SQL_MODEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "model_name": {"type": "string", "description": "Sprechender Name für das neue Semantic Model"},
+        "summary": {"type": "string", "description": "Kurze Erklärung auf Deutsch: was wurde gewählt und warum"},
+        "tables": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "table": {"type": "string", "description": "EXAKTER Tabellenname aus der Liste"},
+                    "table_name": {"type": "string", "description": "Sprechender Tabellenname im Modell"},
+                },
+                "required": ["table", "table_name"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["model_name", "summary", "tables"],
+    "additionalProperties": False,
+}
+
+
+def plan_sql_model(request: str, schema_tables: list) -> dict[str, Any]:
+    """Wählt aus dem Addison-SQL-Schema die passenden Tabellen für ein Modell.
+
+    'schema_tables' = kuratierte, nicht-leere Tabellen mit Spalten (schema_overview).
+    Der Mandantenfilter wird NICHT von Claude gesetzt (der Nutzer wählt den
+    Mandanten in der UI, das Backend filtert) – Claude wählt nur die Tabellen.
+    """
+    system = (
+        "Du wählst aus einer Addison-Buchhaltungsdatenbank (MS SQL) die passenden "
+        "Tabellen für ein neues Power-BI-Semantic-Model. Unten stehen die verfügbaren "
+        "Tabellen mit Zeilenzahl und Spalten.\n"
+        "Regeln:\n"
+        "- Verwende in 'table' AUSSCHLIESSLICH exakt die Tabellennamen aus der Liste – "
+        "erfinde nichts.\n"
+        "- Wähle nur, was zum Wunsch des Nutzers passt, aber nimm die dazugehörigen "
+        "Stammdaten-/Dimensionstabellen mit, damit sinnvolle Beziehungen entstehen "
+        "(z. B. zu Salden/Bewegungen die passende Stamm-Tabelle: SaldenSachkonten + "
+        "StammSachkonten, KontenblattDebitoren + StammDebitoren usw.).\n"
+        "- Die Daten sind eine Multi-Mandanten-DB; der Mandantenfilter wird automatisch "
+        "gesetzt – darum musst du dich NICHT kümmern.\n"
+        "- Bevorzuge für Übersichts-/Kennzahl-Dashboards die aggregierten Salden-Tabellen "
+        "(SaldenSachkonten) gegenüber den sehr großen Bewegungstabellen (KontenblattSachkonten), "
+        "außer der Nutzer will ausdrücklich Einzelbuchungen.\n"
+        "- Gib jeder Tabelle einen sprechenden Namen und dem Modell einen passenden Namen.\n\n"
+        f"Verfügbare Tabellen:\n{json.dumps(schema_tables, ensure_ascii=False, indent=2)}"
+    )
+    return _complete_json(system, request, _SQL_MODEL_SCHEMA)
+
+
 def design_report(prompt: str, schema_text: str) -> dict[str, Any]:
     """Lässt Claude ein Dashboard-Layout entwerfen (Seiten + Visuals).
 

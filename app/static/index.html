@@ -78,6 +78,7 @@
         <div class="tab" data-mode="measure">📐 Kennzahl hinzufügen</div>
         <div class="tab" data-mode="import">🗄️ Modell aus Datei</div>
         <div class="tab" data-mode="sharepoint">🔗 Aus SharePoint</div>
+        <div class="tab" data-mode="sql">🗃️ Aus Addison/SQL</div>
       </div>
 
       <div class="row" id="datasetRow">
@@ -95,6 +96,28 @@
           <summary>Enthaltene Felder (zum Referenzieren)</summary>
           <div class="overview" id="overview" style="margin-top:8px"><span class="muted">…</span></div>
         </details>
+      </div>
+
+      <div id="spRow" style="display:none">
+        <div class="row">
+          <label for="spTarget">Was möchtest du tun?</label>
+          <select id="spTarget">
+            <option value="new">Neues Modell aus SharePoint anlegen</option>
+            <option value="existing">Tabelle zu bestehendem Modell hinzufügen</option>
+          </select>
+        </div>
+        <div class="row" id="spExistingRow" style="display:none">
+          <label for="spDataset">Zielmodell</label>
+          <select id="spDataset"><option>Lade…</option></select>
+        </div>
+      </div>
+
+      <div id="sqlRow" style="display:none">
+        <div class="row">
+          <label for="sqlMandant">Mandant</label>
+          <select id="sqlMandant"><option>Lade…</option></select>
+          <div class="hint">Das Modell wird auf genau diesen Mandanten gefiltert (v1).</div>
+        </div>
       </div>
 
       <div class="row" id="promptRow">
@@ -142,6 +165,8 @@
     let pendingPlan = null;
     let pendingCreate = null;
     let pendingSp = null;   // geplantes SharePoint-Modell (noch nicht angelegt)
+    let pendingSql = null;  // geplantes Addison/SQL-Modell (noch nicht angelegt)
+    let mandantenLoaded = false;
     const $ = (id) => document.getElementById(id);
 
     async function api(url, opts) {
@@ -159,6 +184,7 @@
         const d = await api("/datasets");
         fill("dataset", d.datasets, "id", "name");
         fill("importDataset", d.datasets, "id", "name");
+        fill("spDataset", d.datasets, "id", "name");
       } catch (e) { /* ignore */ }
     }
     refreshDatasets();
@@ -231,13 +257,15 @@
     function setModeUI() {
       const create = mode === "create", modify = mode === "modify",
             measure = mode === "measure", isImport = mode === "import",
-            sp = mode === "sharepoint";
+            sp = mode === "sharepoint", sql = mode === "sql";
       $("datasetRow").style.display = (create || measure) ? "" : "none";
       $("reportRow").style.display = modify ? "" : "none";
       $("overviewRow").style.display = modify ? "" : "none";
       $("promptRow").style.display = isImport ? "none" : "";
       $("go").style.display = isImport ? "none" : "";
       $("importRow").style.display = isImport ? "" : "none";
+      $("spRow").style.display = sp ? "" : "none";
+      $("sqlRow").style.display = sql ? "" : "none";
       if (modify) loadOverview();
       if (isImport) { setImportTargetUI(); return; }
       if (measure) {
@@ -251,10 +279,14 @@
         $("hint").textContent = "Claude entwirft das Layout und legt einen neuen Report im Workspace an.";
         $("go").textContent = "Dashboard erstellen";
       } else if (sp) {
-        $("promptLabel").textContent = "Welches Modell soll aus SharePoint entstehen?";
-        $("prompt").placeholder = "z. B. Ein Modell für unsere Vertriebszahlen";
-        $("hint").textContent = "Claude sucht die passenden Dateien in SharePoint und gruppiert sie zu Tabellen – du siehst erst eine Vorschau und bestätigst dann.";
         $("go").textContent = "Datenquellen suchen";
+        setSpTargetUI();   // setzt Label/Placeholder/Hint je nach Ziel (neu/bestehend)
+      } else if (sql) {
+        $("promptLabel").textContent = "Welches Modell soll aus Addison entstehen?";
+        $("prompt").placeholder = "z. B. Übersicht der Sachkontensalden";
+        $("hint").textContent = "Claude wählt die passenden Addison-Tabellen und baut ein Live-SQL-Modell für den gewählten Mandanten (kein Zeilenlimit).";
+        $("go").textContent = "Datenquellen suchen";
+        loadMandanten();
       } else {
         $("promptLabel").textContent = "Was soll geändert werden?";
         $("prompt").placeholder = "z. B. Mach aus dem Balkendiagramm ein Kreisdiagramm und füge eine Karte für Erlös Netto hinzu";
@@ -284,7 +316,7 @@
       discardActivePreview(false);  // ggf. offene Vorschau des alten Tabs verwerfen
       document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
       t.classList.add("active"); mode = t.dataset.mode;
-      pendingPlan = null; pendingCreate = null; pendingSp = null;
+      pendingPlan = null; pendingCreate = null; pendingSp = null; pendingSql = null;
       $("result").innerHTML = ""; setModeUI();
     });
 
@@ -338,6 +370,13 @@
             body: JSON.stringify({ prompt: text })
           });
           renderSpPlan(pendingSp);
+        } else if (mode === "sql") {
+          out.innerHTML = '<div class="spinner">⏳ Addison wird analysiert…</div>';
+          pendingSql = await api("/sql/plan-model", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ prompt: text })
+          });
+          renderSqlPlan(pendingSql);
         } else if (mode === "measure") {
           const d = await api("/add-measure", {
             method: "POST", headers: { "Content-Type": "application/json" },
@@ -530,7 +569,26 @@
     }
 
     // ── Modell aus SharePoint (Phase 3) ──────────────────────────
+    function setSpTargetUI() {
+      const existing = $("spTarget").value === "existing";
+      $("spExistingRow").style.display = existing ? "" : "none";
+      if (existing) {
+        $("promptLabel").textContent = "Welche Tabelle soll aus SharePoint hinzugefügt werden?";
+        $("prompt").placeholder = "z. B. Die Makros als weitere Tabelle";
+        $("hint").textContent = "Claude sucht die passenden Dateien in SharePoint und hängt sie als Live-Tabelle an das gewählte Modell an – ohne die 10.000-Zeilen-Grenze des Datei-Uploads.";
+      } else {
+        $("promptLabel").textContent = "Welches Modell soll aus SharePoint entstehen?";
+        $("prompt").placeholder = "z. B. Ein Modell für unsere Vertriebszahlen";
+        $("hint").textContent = "Claude sucht die passenden Dateien in SharePoint und gruppiert sie zu Tabellen – du siehst erst eine Vorschau und bestätigst dann.";
+      }
+    }
+    $("spTarget").onchange = () => { setSpTargetUI(); pendingSp = null; $("result").innerHTML = ""; };
+
     function renderSpPlan(p) {
+      const existing = $("spTarget").value === "existing";
+      const targetSel = $("spDataset");
+      const targetName = existing && targetSel.selectedIndex >= 0
+        ? targetSel.options[targetSel.selectedIndex].text : "";
       const rows = (p.tables || []).map(t => {
         const shown = (t.sample_files || []).map(escapeHtml).join(", ");
         const more = t.file_count > (t.sample_files || []).length
@@ -544,15 +602,18 @@
       }).join("");
       const dropped = (p.dropped || []).length
         ? `<p class="hint">ℹ️ ${p.dropped.length} vorgeschlagene(r) Ordner existiert nicht und wurde verworfen.</p>` : "";
+      const header = existing
+        ? `<p class="hint">Diese Tabelle(n) werden dem Modell <b>${escapeHtml(targetName)}</b> hinzugefügt:</p>`
+        : `<p class="hint">Neues Modell: <b>${escapeHtml(p.model_name)}</b> — diese Tabellen entstehen:</p>`;
+      const btnLabel = existing ? "Tabelle(n) hinzufügen" : "Modell anlegen";
       $("result").innerHTML =
-        `<div class="explain">${escapeHtml(p.summary)}</div>` + dropped +
-        `<p class="hint">Neues Modell: <b>${escapeHtml(p.model_name)}</b> — diese Tabellen entstehen:</p>` +
+        `<div class="explain">${escapeHtml(p.summary)}</div>` + dropped + header +
         `<ul class="log">${rows || "<li>Keine passenden Ordner gefunden.</li>"}</ul>` +
         `<div class="actions"><button class="sec" id="spCancel">Verwerfen</button>` +
-        `<button class="prim" id="spCreate">Modell anlegen</button></div>` +
+        `<button class="prim" id="spCreate">${btnLabel}</button></div>` +
         `<p class="hint">Danach werden die Daten geladen – das dauert i. d. R. ~1 Minute.</p>`;
       $("spCancel").onclick = () => { pendingSp = null; $("result").innerHTML = ""; };
-      $("spCreate").onclick = createSpModel;
+      $("spCreate").onclick = existing ? addSpTable : createSpModel;
     }
 
     async function createSpModel() {
@@ -599,6 +660,43 @@
       }
     }
 
+    async function addSpTable() {
+      if (!pendingSp) return;
+      const out = $("result");
+      const modelId = $("spDataset").value;
+      if (!modelId) { out.innerHTML = '<div class="err">Bitte ein Zielmodell wählen.</div>'; return; }
+      const p = pendingSp; pendingSp = null;
+      out.innerHTML = '<div class="spinner">⏳ Tabelle(n) werden angehängt…</div>';
+      try {
+        const d = await api("/sharepoint/add-table", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model_id: modelId,
+            // files MUSS mit – sonst nimmt das Backend alle Dateien des Ordners
+            tables: (p.tables || []).map(t => ({
+              folder: t.folder, table_name: t.table_name,
+              files: t.files, recursive: t.recursive, sheet: t.sheet
+            }))
+          })
+        });
+        const rows = (d.tables || []).map(t =>
+          `<li><span class="vt">${escapeHtml(t.table_name)}</span>` +
+          `<span class="muted">${(t.columns || []).length} Spalten · ${t.file_count} Datei(en)` +
+          `${t.recursive ? " inkl. Unterordner" : ""}</span></li>`
+        ).join("");
+        out.innerHTML = `<p class="ok">✅ Tabelle(n) wurden dem Modell hinzugefügt.</p>` +
+          `<ul class="log">${rows}</ul>` +
+          `<div class="explain">Jetzt noch die Daten laden. Das Modell nutzt dieselbe SharePoint-Site wie bisher – meist ist <b>keine</b> erneute Autorisierung nötig.</div>` +
+          `<p class="hint">Falls keine Zeilen erscheinen, die Datenquelle einmalig ` +
+          `<a class="open" href="${d.settings_url}" target="_blank">in Power BI autorisieren ↗</a> und erneut „Daten laden".</p>` +
+          `<div class="actions"><button class="prim" id="spLoad">Daten laden</button></div>`;
+        $("spLoad").onclick = () => loadSpData(d.model_id, (d.tables[0] || {}).table_name);
+        refreshDatasets();
+      } catch (e) {
+        out.innerHTML = `<div class="err">Fehler: ${e.message}</div>`;
+      }
+    }
+
     async function loadSpData(modelId, tableName) {
       const out = $("result");
       $("spLoad").disabled = true;
@@ -622,6 +720,113 @@
         err.textContent = "Fehler: " + e.message;
         out.appendChild(err);
         $("spLoad").disabled = false;
+      }
+    }
+
+    // ── Modell aus Addison/SQL (Variante C) ──────────────────────
+    async function loadMandanten() {
+      if (mandantenLoaded) return;
+      const sel = $("sqlMandant");
+      try {
+        const d = await api("/sql/mandanten");
+        sel.innerHTML = "";
+        (d.mandanten || []).forEach(m => {
+          const o = document.createElement("option");
+          o.value = m.mandant_id;
+          o.textContent = `${m.name} (${m.mandant})`;
+          sel.appendChild(o);
+        });
+        if (!sel.options.length) sel.innerHTML = "<option value=''>Keine aktiven Mandanten</option>";
+        mandantenLoaded = true;
+      } catch (e) {
+        sel.innerHTML = `<option value=''>Fehler: ${e.message}</option>`;
+      }
+    }
+
+    function renderSqlPlan(p) {
+      const rows = (p.tables || []).map(t =>
+        `<li><span class="vt">${escapeHtml(t.table_name)}</span>` +
+        `<span class="muted">🗃️ ${escapeHtml(t.table)} · ${(t.columns || []).length} Spalten</span></li>`
+      ).join("");
+      const dropped = (p.dropped || []).length
+        ? `<p class="hint">ℹ️ ${p.dropped.length} vorgeschlagene Tabelle(n) existieren nicht und wurden verworfen.</p>` : "";
+      const mSel = $("sqlMandant");
+      const mName = mSel.selectedIndex >= 0 ? mSel.options[mSel.selectedIndex].text : "";
+      $("result").innerHTML =
+        `<div class="explain">${escapeHtml(p.summary)}</div>` + dropped +
+        `<p class="hint">Neues Modell: <b>${escapeHtml(p.model_name)}</b> für Mandant <b>${escapeHtml(mName)}</b> — diese Tabellen entstehen:</p>` +
+        `<ul class="log">${rows || "<li>Keine passenden Tabellen gefunden.</li>"}</ul>` +
+        `<div class="actions"><button class="sec" id="sqlCancel">Verwerfen</button>` +
+        `<button class="prim" id="sqlCreate">Modell anlegen</button></div>` +
+        `<p class="hint">Danach muss das Modell einmalig der Gateway-Verbindung zugeordnet werden.</p>`;
+      $("sqlCancel").onclick = () => { pendingSql = null; $("result").innerHTML = ""; };
+      $("sqlCreate").onclick = createSqlModel;
+    }
+
+    async function createSqlModel() {
+      if (!pendingSql) return;
+      const mandantId = $("sqlMandant").value;
+      if (!mandantId) { $("result").innerHTML = '<div class="err">Bitte einen Mandanten wählen.</div>'; return; }
+      const p = pendingSql; pendingSql = null;
+      const out = $("result");
+      out.innerHTML = '<div class="spinner">⏳ Modell wird angelegt…</div>';
+      try {
+        const d = await api("/sql/create-model", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model_name: p.model_name, mandant_id: mandantId,
+            tables: (p.tables || []).map(t => ({ table: t.table, table_name: t.table_name }))
+          })
+        });
+        const rows = (d.tables || []).map(t =>
+          `<li><span class="vt">${escapeHtml(t.table_name)}</span>` +
+          `<span class="muted">${(t.columns || []).length} Spalten${t.mandant_filtered ? "" : " · alle Mandanten"}</span></li>`
+        ).join("");
+        const rels = (d.relationships || []).length
+          ? `<p class="hint" style="margin-top:10px">🔗 Beziehungen automatisch angelegt:</p><ul class="log">` +
+            d.relationships.map(r =>
+              `<li><span class="muted">${escapeHtml(r.from)} → ${escapeHtml(r.to)}</span></li>`).join("") +
+            `</ul>`
+          : "";
+        out.innerHTML = `<p class="ok">✅ Modell „${escapeHtml(d.model_name)}" wurde angelegt.</p>` +
+          `<ul class="log">${rows}</ul>` + rels +
+          `<div class="explain"><b>Noch ein letzter Schritt:</b> Das Modell muss einmalig der ` +
+          `Gateway-Verbindung zugeordnet werden, damit Power BI die Daten aus Addison laden darf.</div>` +
+          `<ol class="log"><li><a class="open" style="margin:6px 0" href="${d.settings_url}" target="_blank">Einstellungen in Power BI öffnen ↗</a></li>` +
+          `<li><b>„Gateway- und Cloudverbindungen"</b> aufklappen → Gateway <b>Addison-EC2</b> wählen</li>` +
+          `<li>Die Datenquelle der Verbindung <b>zuordnen</b> → <b>„Übernehmen"</b></li>` +
+          `<li>Zurück hierher und <b>„Daten laden"</b> klicken</li></ol>` +
+          `<div class="actions"><button class="prim" id="sqlLoad">Daten laden</button></div>`;
+        $("sqlLoad").onclick = () => loadSqlData(d.model_id, (d.tables[0] || {}).table_name);
+        refreshDatasets();
+      } catch (e) {
+        out.innerHTML = `<div class="err">Fehler: ${e.message}</div>`;
+      }
+    }
+
+    async function loadSqlData(modelId, tableName) {
+      const out = $("result");
+      $("sqlLoad").disabled = true;
+      const note = document.createElement("div");
+      note.className = "spinner";
+      note.textContent = "⏳ Daten werden aus Addison geladen… (~1 Min., bitte warten)";
+      out.appendChild(note);
+      try {
+        const d = await api("/sql/load-data", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model_id: modelId, table_name: tableName })
+        });
+        out.innerHTML = (d.rows == null)
+          ? `<p class="ok">✅ Aktualisierung gestartet.</p><p class="hint">Die Daten werden noch im Hintergrund geladen – schau gleich nochmal in Power BI.</p>`
+          : `<p class="ok">✅ ${d.rows} Zeilen aus Addison geladen (Tabelle „${escapeHtml(d.table_name)}").</p>` +
+            `<p class="hint">Das Modell steht jetzt in „Dashboard erstellen" und „Kennzahl hinzufügen" zur Auswahl.</p>`;
+      } catch (e) {
+        note.remove();
+        const err = document.createElement("div");
+        err.className = "err";
+        err.textContent = "Fehler: " + e.message;
+        out.appendChild(err);
+        $("sqlLoad").disabled = false;
       }
     }
   </script>

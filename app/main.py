@@ -9,7 +9,9 @@ Starten:  uvicorn app.main:app --reload
 """
 import base64
 import json
+import logging
 import secrets
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -20,8 +22,8 @@ from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import (ai, auth_web, fabric, model_import, powerbi, report_builder,
-               report_editor, sharepoint)
+from . import (ai, auth_web, fabric, model_import, mssql, powerbi,
+               report_builder, report_editor, sharepoint)
 from .config import settings
 
 app = FastAPI(title="PowerBI-Generator")
@@ -278,12 +280,38 @@ class SharePointModelRequest(BaseModel):
     tables: list[SharePointTable]
 
 
+class SharePointAddTableRequest(BaseModel):
+    model_id: str                        # bestehendes Modell, an das angehängt wird
+    tables: list[SharePointTable]
+
+
 class SharePointPlanRequest(BaseModel):
     prompt: str
     root: str = ""    # Unterordner als Startpunkt (leer = ganze Bibliothek)
 
 
 class SharePointLoadRequest(BaseModel):
+    model_id: str
+    table_name: str
+
+
+# ── Addison / MS SQL (Variante C) ──────────────────────────────
+class SqlPlanRequest(BaseModel):
+    prompt: str
+
+
+class SqlTable(BaseModel):
+    table: str                      # exakter SQL-Tabellenname (dbo)
+    table_name: str | None = None   # sonst = SQL-Name
+
+
+class SqlModelRequest(BaseModel):
+    model_name: str
+    mandant_id: str                 # v1: genau EIN Mandant, alle Tabellen darauf gefiltert
+    tables: list[SqlTable]
+
+
+class SqlLoadRequest(BaseModel):
     model_id: str
     table_name: str
 
@@ -854,6 +882,50 @@ def sharepoint_create_model(req: SharePointModelRequest,
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@app.post("/sharepoint/add-table")
+def sharepoint_add_table(req: SharePointAddTableRequest,
+                         user: dict = Depends(require_user)) -> dict:
+    """Hängt eine oder mehrere LIVE-SharePoint-Tabellen an ein bestehendes Modell an.
+
+    Anders als bei /import/add-table wird die Tabelle nicht eingebettet, sondern
+    zeigt (wie bei create-model) live auf die SharePoint-Dateien – ohne die
+    10.000-Zeilen-Grenze des Datei-Uploads. Es wird KEIN Refresh ausgelöst: das
+    macht anschließend der bestehende /sharepoint/load-data-Weg. Meist ist keine
+    erneute Autorisierung nötig, weil das Modell dieselbe SharePoint-Site nutzt,
+    die schon autorisiert ist – falls doch (z. B. bei einem bisher reinen Datei-
+    Modell), führt der Load-Schritt bzw. der Einstellungs-Link durch die Freigabe.
+    """
+    if not settings.sharepoint_site_url:
+        raise HTTPException(status_code=400,
+                            detail="SharePoint ist nicht konfiguriert (SHAREPOINT_SITE_URL fehlt).")
+    if not req.tables:
+        raise HTTPException(status_code=400, detail="Keine Ordner/Tabellen angegeben.")
+    try:
+        table_objs: list[dict] = []
+        infos: list[dict] = []
+        for t in req.tables:
+            obj, info = _table_from_folder(t.folder, t.table_name, t.files,
+                                           t.recursive, t.sheet)
+            table_objs.append(obj)
+            infos.append(info)
+
+        parts = fabric.get_model_definition(req.model_id, fmt="TMSL")
+        bim_part = next(p for p in parts if p["path"].endswith(".bim"))
+        bim = json.loads(base64.b64decode(bim_part["payload"]))
+        for obj in table_objs:
+            _add_table_to_bim(bim, obj)   # bricht bei Namenskollision klar ab
+        bim_part["payload"] = base64.b64encode(
+            json.dumps(bim, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        fabric.update_model_definition(req.model_id, parts)
+        _clear_schema_cache()  # Schema-Cache invalidieren (neue Tabelle)
+
+        return {"model_id": req.model_id, "tables": infos,
+                "settings_url": (f"https://app.powerbi.com/groups/{settings.pbi_workspace_id}"
+                                 f"/settings/datasets/{req.model_id}")}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.post("/sharepoint/load-data")
 def sharepoint_load_data(req: SharePointLoadRequest,
                          user: dict = Depends(require_user)) -> dict:
@@ -880,6 +952,347 @@ def sharepoint_load_data(req: SharePointLoadRequest,
         except Exception:  # noqa: BLE001
             continue
     return {"rows": None, "table_name": req.table_name}  # lädt noch im Hintergrund
+
+
+# ── Variante C: Addison / MS SQL ───────────────────────────────
+_SQL_SCHEMA = "dbo"
+_MANDANT_COL = "MandantId"
+# Mandanten-/Org-Spalten sind im Single-Mandant-Modell konstant -> KEINE Join-Schlüssel
+# (sonst „ambiguous paths": alles hinge über MandantId an allem).
+_MANDANT_JOIN_EXCLUDE = {"MandantId", "Mandant", "OrgId", "OrgIdName", "MandantGuid"}
+
+
+@app.get("/sql/mandanten")
+def sql_mandanten(user: dict = Depends(require_user)) -> dict:
+    """Aktive Mandanten (MandantId + Klarname) für die Auswahl im Frontend."""
+    if not mssql.is_configured():
+        raise HTTPException(status_code=400,
+                            detail="Addison-SQL ist nicht konfiguriert (ADDISON_SQL_* fehlt).")
+    try:
+        return {"mandanten": mssql.list_mandanten(active_only=True)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/sql/plan-model")
+def sql_plan_model(req: SqlPlanRequest, user: dict = Depends(require_user)) -> dict:
+    """Prompt -> Claude wählt die passenden SQL-Tabellen (nur Vorschau, schreibt nichts).
+
+    Die Tabellenauswahl ist mandantenunabhängig (gleiches Schema für alle) – den
+    Mandanten wählt der Nutzer separat; das Backend filtert erst beim Anlegen.
+    """
+    if not mssql.is_configured():
+        raise HTTPException(status_code=400,
+                            detail="Addison-SQL ist nicht konfiguriert (ADDISON_SQL_* fehlt).")
+    try:
+        overview = mssql.schema_overview()   # nicht-leere Tabellen + Spalten
+        plan = ai.plan_sql_model(req.prompt, overview)
+        cols_by = {t["table"]: t["columns"] for t in overview}
+        rows_by = {t["table"]: t["rows"] for t in overview}
+        tables: list[dict] = []
+        dropped: list[str] = []
+        seen: set[str] = set()
+        for t in plan.get("tables", []):
+            tbl = t.get("table")
+            if tbl not in cols_by:
+                dropped.append(str(tbl))
+                continue
+            if tbl in seen:
+                continue
+            seen.add(tbl)
+            tables.append({
+                "table": tbl,
+                "table_name": t.get("table_name") or tbl,
+                "rows_total": rows_by.get(tbl),
+                "columns": [{"name": c["name"], "type": c["type"]} for c in cols_by[tbl]],
+            })
+        if not tables:
+            raise RuntimeError("Zum Wunsch wurden keine passenden Tabellen gefunden.")
+        return {"model_name": plan["model_name"], "summary": plan["summary"],
+                "tables": tables, "dropped": dropped}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+def _plan_sql_relationships(mandant_id: str, infos: list[dict]) -> list[dict]:
+    """Beziehungen vorschlagen (Claude) und JEDE gegen die echten SQL-Daten prüfen.
+
+    'infos' je Tabelle: sql_table, table_name (im Modell), columns, mandant_filtered.
+    Die Eine-Seite (to_column) muss per SQL nachweislich eindeutig sein – nur
+    Spalten, die in ≥2 Tabellen vorkommen, werden überhaupt geprüft (Join-Kandidaten).
+    """
+    counts: dict[str, int] = {}
+    for i in infos:
+        for c in {c["name"] for c in i["columns"]}:
+            counts[c] = counts.get(c, 0) + 1
+    candidates = {c for c, n in counts.items()
+                  if n >= 2 and c not in _MANDANT_JOIN_EXCLUDE}
+
+    unique_map: dict[str, set] = {}
+    ai_input: list[dict] = []
+    for i in infos:
+        here = {c["name"] for c in i["columns"]}
+        uniq: list[str] = []
+        for c in (candidates & here):
+            mcol = _MANDANT_COL if i["mandant_filtered"] else None
+            mval = mandant_id if i["mandant_filtered"] else None
+            try:
+                if mssql.column_is_unique(_SQL_SCHEMA, i["sql_table"], c, mcol, mval):
+                    uniq.append(c)
+            except Exception:  # noqa: BLE001
+                pass
+        unique_map[i["table_name"]] = set(uniq)
+        ai_input.append({"table_name": i["table_name"],
+                         "columns": [c["name"] for c in i["columns"]],
+                         "unique_columns": uniq,
+                         "vollstaendig_geprueft": True})
+    try:
+        plan = ai.plan_relationships(ai_input)
+    except Exception:  # noqa: BLE001
+        return []
+
+    by_name = {i["table_name"]: i for i in infos}
+    parent: dict[str, str] = {}   # Union-Find über die Tabellen (Wald-Schutz)
+
+    def _root(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for r in plan.get("relationships", []):
+        ft, fc = r.get("from_table"), r.get("from_column")
+        tt, tc = r.get("to_table"), r.get("to_column")
+        if ft not in by_name or tt not in by_name or ft == tt:
+            continue
+        if fc not in {c["name"] for c in by_name[ft]["columns"]}:
+            continue
+        if tc not in {c["name"] for c in by_name[tt]["columns"]}:
+            continue
+        if tc not in unique_map.get(tt, set()):   # Eine-Seite muss verifiziert eindeutig sein
+            continue
+        key = (ft, fc, tt, tc)
+        if key in seen:
+            continue
+        # Wald-Schutz: keine zweite Verbindung zwischen schon (indirekt) verbundenen
+        # Tabellen -> verhindert „ambiguous paths", die Power BI beim Anlegen ablehnt.
+        if _root(ft) == _root(tt):
+            continue
+        seen.add(key)
+        parent[_root(ft)] = _root(tt)
+        out.append(model_import.build_relationship(ft, fc, tt, tc))
+    return out
+
+
+@app.post("/sql/create-model")
+def sql_create_model(req: SqlModelRequest, user: dict = Depends(require_user)) -> dict:
+    """Semantic Model anlegen, das live auf die Addison-SQL-Tabellen zeigt (ein Mandant).
+
+    Wie SharePoint-Variante-B: keine eingebetteten Daten. Danach muss das Modell
+    einmalig der Gateway-Verbindung zugeordnet werden (settings_url), dann lädt
+    /sql/load-data die Daten.
+    """
+    if not mssql.is_configured():
+        raise HTTPException(status_code=400,
+                            detail="Addison-SQL ist nicht konfiguriert (ADDISON_SQL_* fehlt).")
+    if not req.tables:
+        raise HTTPException(status_code=400, detail="Keine Tabellen angegeben.")
+    if not req.mandant_id:
+        raise HTTPException(status_code=400, detail="Kein Mandant gewählt.")
+    try:
+        name = model_import.sanitize_name(req.model_name)
+        srv, port, db = (settings.addison_sql_server, settings.addison_sql_port,
+                         settings.addison_sql_database)
+        table_objs: list[dict] = []
+        infos: list[dict] = []
+        out_tables: list[dict] = []
+        for t in req.tables:
+            cols = mssql.get_columns(_SQL_SCHEMA, t.table)
+            if not cols:
+                continue   # Tabelle existiert nicht -> überspringen
+            has_mandant = any(c["name"] == _MANDANT_COL for c in cols)
+            mcol = _MANDANT_COL if has_mandant else None
+            mval = req.mandant_id if has_mandant else None
+            friendly = model_import.sanitize_name(t.table_name or t.table)
+            obj = model_import.build_sql_table_object(
+                srv, port, db, _SQL_SCHEMA, t.table, cols,
+                table_name=friendly, mandant_col=mcol, mandant_val=mval)
+            table_objs.append(obj)
+            infos.append({"sql_table": t.table, "table_name": obj["name"],
+                          "columns": cols, "mandant_filtered": has_mandant})
+            out_tables.append({"table": t.table, "table_name": obj["name"],
+                               "mandant_filtered": has_mandant,
+                               "columns": [{"name": c["name"], "type": c["type"]} for c in cols]})
+        if not table_objs:
+            raise RuntimeError("Keine gültigen Tabellen gefunden.")
+
+        rels = _plan_sql_relationships(req.mandant_id, infos) if len(infos) > 1 else []
+        bim = model_import.build_model_bim_tables(name, table_objs, rels)
+        parts = [report_builder.make_part("definition.pbism", _PBISM),
+                 report_builder.make_part("model.bim", bim)]
+        try:
+            res = fabric.create_semantic_model(name, parts)
+        except RuntimeError as e:
+            if "AlreadyInUse" in str(e) or "already exists" in str(e).lower():
+                raise RuntimeError(f"Ein Modell namens '{name}' existiert bereits – "
+                                   "bitte einen anderen Namen wählen.")
+            raise
+        mid = res.get("id")
+        if mid:
+            _clear_schema_cache()
+        return {"model_id": mid, "model_name": name, "mandant_id": req.mandant_id,
+                "tables": out_tables,
+                "relationships": [{"from": f'{r["fromTable"]}[{r["fromColumn"]}]',
+                                   "to": f'{r["toTable"]}[{r["toColumn"]}]'} for r in rels],
+                "needs_authorization": True,
+                "settings_url": (f"https://app.powerbi.com/groups/{settings.pbi_workspace_id}"
+                                 f"/settings/datasets/{mid}") if mid else None}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.post("/sql/load-data")
+def sql_load_data(req: SqlLoadRequest, user: dict = Depends(require_user)) -> dict:
+    """Daten laden – nachdem das Modell der Gateway-Verbindung zugeordnet wurde."""
+    try:
+        powerbi.refresh_dataset(req.model_id)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400,
+            detail="Die Daten konnten nicht geladen werden. Ist das Modell der "
+                   f"Gateway-Verbindung zugeordnet? (Details: {str(e)[:200]})")
+    query = f'EVALUATE ROW("n", COUNTROWS(\'{req.table_name}\'))'
+    for _ in range(18):
+        time.sleep(5)
+        try:
+            rows = powerbi.execute_dax(query, req.model_id)
+            _clear_schema_cache()
+            return {"rows": rows[0].get("[n]") if rows else None,
+                    "table_name": req.table_name}
+        except Exception:  # noqa: BLE001
+            continue
+    return {"rows": None, "table_name": req.table_name}
+
+
+# ── Gesamtmodell: 1:1-Abbild des Addison-Schemas (ohne KI) ─────
+_addison_log = logging.getLogger("addison")
+
+
+def _build_addison_full_bim(model_name: str) -> dict:
+    """Baut das model.bim für das komplette Addison-Schema.
+
+    ALLE Tabellen (auch die in der Kopie leeren – sie sind in der Live-DB gefüllt)
+    und ALLE in der DB deklarierten Foreign Keys als Beziehungen. Kein Mandanten-
+    filter (alle Mandanten), kein Claude – die Struktur kommt direkt aus dem
+    SQL-Katalog.
+    """
+    srv, port, db = (settings.addison_sql_server, settings.addison_sql_port,
+                     settings.addison_sql_database)
+    tables = mssql.schema_overview(min_rows=0)     # alle Tabellen inkl. leere, mit Spalten
+    if not tables:
+        raise RuntimeError("Im Addison-Schema wurden keine Tabellen gefunden.")
+    table_objs: list[dict] = []
+    for t in tables:
+        if not t.get("columns"):
+            continue   # ohne Spalten keine sinnvolle Tabelle
+        table_objs.append(model_import.build_sql_table_object(
+            srv, port, db, t["schema"], t["table"], t["columns"],
+            table_name=t["table"]))          # roher SQL-Name = Modell-Name (1:1)
+    names = [o["name"] for o in table_objs]
+    rels = model_import.build_fk_relationships(mssql.foreign_keys(), names)
+    bim = model_import.build_model_bim_tables(model_name, table_objs, rels)
+    return bim
+
+
+def _ensure_addison_model(force: bool = False) -> dict:
+    """Legt das Gesamtmodell an, falls es noch nicht existiert (idempotent).
+
+    Gibt Status zurück. 'force' überspringt nur die Namensprüfung nicht – ein
+    bereits existierendes Modell wird NIE überschrieben (Power BI würde beim
+    Anlegen ohnehin mit 'AlreadyInUse' ablehnen). Wirft bei echten Fehlern.
+    """
+    if not mssql.is_configured():
+        raise RuntimeError("Addison-SQL ist nicht konfiguriert (ADDISON_SQL_* fehlt).")
+    name = model_import.sanitize_name(settings.addison_model_name)
+    existing = next((d for d in powerbi.list_datasets() if d.get("name") == name), None)
+    if existing and not force:
+        return {"created": False, "reason": "exists", "model_id": existing["id"],
+                "model_name": name}
+
+    bim = _build_addison_full_bim(name)
+    rels = bim["model"].get("relationships", [])
+    parts = [report_builder.make_part("definition.pbism", _PBISM),
+             report_builder.make_part("model.bim", bim)]
+    res = fabric.create_semantic_model(name, parts)
+    mid = res.get("id")
+    if mid:
+        _clear_schema_cache()
+    inactive = sum(1 for r in rels if r.get("isActive") is False)
+    return {"created": True, "reason": "created", "model_id": mid, "model_name": name,
+            "tables": len(bim["model"]["tables"]),
+            "relationships": len(rels), "inactive_relationships": inactive,
+            "needs_authorization": True,
+            "settings_url": (f"https://app.powerbi.com/groups/{settings.pbi_workspace_id}"
+                             f"/settings/datasets/{mid}") if mid else None}
+
+
+@app.post("/sql/create-full-model")
+def sql_create_full_model(user: dict = Depends(require_user)) -> dict:
+    """Gesamtmodell (alle Tabellen + alle FK-Beziehungen) manuell anlegen.
+
+    Derselbe Weg, der beim App-Start automatisch läuft – hier auf Knopfdruck.
+    Danach muss das Modell einmalig der Gateway-Verbindung zugeordnet werden
+    (settings_url), dann können die Daten geladen/aktualisiert werden.
+    """
+    if not mssql.is_configured():
+        raise HTTPException(status_code=400,
+                            detail="Addison-SQL ist nicht konfiguriert (ADDISON_SQL_* fehlt).")
+    try:
+        return _ensure_addison_model()
+    except RuntimeError as e:
+        if "AlreadyInUse" in str(e) or "already exists" in str(e).lower():
+            raise HTTPException(status_code=409,
+                                detail=f"Ein Modell namens '{settings.addison_model_name}' "
+                                       "existiert bereits.")
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+def _auto_create_addison_model() -> None:
+    """Startup-Task (im Hintergrund): Gesamtmodell anlegen, falls konfiguriert & fehlend.
+
+    Läuft in einem Daemon-Thread, blockiert den App-Start nicht und schluckt
+    Fehler (DB/Gateway offline darf die App nicht am Starten hindern) – sie werden
+    nur geloggt.
+    """
+    if not settings.addison_auto_model:
+        return
+    if not mssql.is_configured():
+        _addison_log.info("Addison-Auto-Modell übersprungen: ADDISON_SQL_* nicht gesetzt.")
+        return
+    try:
+        res = _ensure_addison_model()
+        if res.get("created"):
+            _addison_log.info(
+                "Addison-Gesamtmodell angelegt: '%s' (%s Tabellen, %s Beziehungen). "
+                "Muss noch dem Gateway zugeordnet werden: %s",
+                res["model_name"], res.get("tables"), res.get("relationships"),
+                res.get("settings_url"))
+        else:
+            _addison_log.info("Addison-Gesamtmodell existiert bereits ('%s') – nichts zu tun.",
+                              res.get("model_name"))
+    except Exception as e:  # noqa: BLE001
+        _addison_log.warning("Addison-Auto-Modell fehlgeschlagen (App läuft trotzdem): %s", e)
+
+
+@app.on_event("startup")
+def _startup_addison() -> None:
+    threading.Thread(target=_auto_create_addison_model,
+                     name="addison-auto-model", daemon=True).start()
 
 
 # ── Anpassen: planen -> anwenden ───────────────────────────────

@@ -34,6 +34,22 @@ class Settings(BaseSettings):
     # Leer = SharePoint-Import deaktiviert.
     sharepoint_site_url: str = ""
 
+    # ── Addison / MS SQL (Variante C) ──────────────────────────
+    # Read-only-Zugang zur Addison-Replik (MS SQL Server). Leer = SQL-Import
+    # deaktiviert. Die App liest damit nur das Schema/Stichproben; die Daten
+    # selbst holt später Power BI über eine Sql.Database()-M-Abfrage.
+    addison_sql_server: str = ""
+    addison_sql_port: int = 1433
+    addison_sql_database: str = ""
+    addison_sql_user: str = ""
+    addison_sql_password: str = ""
+
+    # Gesamtmodell (1:1-Abbild des Addison-Schemas): alle Tabellen + alle in der
+    # DB deklarierten Foreign Keys, ohne KI. Wird beim App-Start automatisch
+    # angelegt, falls es noch nicht existiert (idempotent, nicht blockierend).
+    addison_model_name: str = "Addison Gesamtmodell"
+    addison_auto_model: bool = True   # False = kein Auto-Anlegen beim Start
+
     @property
     def authority(self) -> str:
         return f"https://login.microsoftonline.com/{self.azure_tenant_id}"
